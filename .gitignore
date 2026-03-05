@@ -1,0 +1,18 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Training/eval artifacts
+outputs/
+tmp_log_verify/
+
+# Local env/editor
+.venv/
+venv/
+.env
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,66 @@
+# ============================================================
+# Stage 2 — Reverse Sandwich ablation on QALD-9-plus
+# Inverted rank allocation: r_high=4 (edges), r_low=32 (middle)
+# This is an ABLATION — expects its own Stage 1 with the same pattern
+# ============================================================
+model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+task: sparql
+method: alrem
+quantization: "4bit"
+precision: bf16
+output_dir: outputs
+run_name: sparql_s2_reverse_sandwich
+
+# ── Stage 1 checkpoint ──
+# For the reverse-sandwich ablation, you should first run a Stage 1
+# with r_high=4 r_low=32 (create sparql_stage1_reverse_sandwich.yaml
+# by copying stage1_alrem and swapping r_high/r_low) and point here.
+stage1_checkpoint: outputs/sparql_s1_reverse_sandwich
+
+# ── Data ──
+stage2_data_path: data/sparql/qald9plus_stage2_train.jsonl
+stage2_dev_path: data/sparql/qald9plus_stage2_dev.jsonl
+test_data_path: data/sparql/qald9plus_test.jsonl
+test_languages: ["en", "de", "fr", "ru"]
+sparql_cache_dir: data/sparql/cache
+
+# ── LoRA / Reverse ALREM ──
+# INVERTED: edges get low rank, middle gets high rank
+target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+r_high: 4
+r_low: 32
+r_uniform: 16
+cut_ratio_early: 0.25
+cut_ratio_mid: 0.75
+early_end: null
+mid_end: null
+lora_dropout: 0.05
+lora_alpha_mode: "2r"
+lora_alpha_fixed: null
+r_match_max: 128
+
+# ── Training ──
+learning_rate: 1e-4
+num_train_epochs: 5
+max_seq_len: 512
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_steps: -1
+grad_ckpt: true
+seed: 42
+
+# ── Logging / Checkpointing ──
+logging_steps: 10
+evaluation_strategy: steps
+eval_steps: 50
+save_strategy: steps
+save_steps: 50
+save_total_limit: 2
+early_stopping_patience: 5
+
+# ── Misc ──
+max_train_samples: null
+max_eval_samples: null
+resume_from_checkpoint: null

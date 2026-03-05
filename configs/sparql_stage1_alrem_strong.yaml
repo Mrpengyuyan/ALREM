@@ -1,0 +1,54 @@
+# ============================================================
+# Stage 1 — ALREM Strong Bottleneck on LC-QuAD 2.0 (English)
+# r_high=32, r_low=4 (stronger middle-layer bottleneck)
+# ============================================================
+model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+task: sparql
+method: alrem
+quantization: "4bit"
+precision: bf16
+output_dir: outputs
+run_name: sparql_s1_alrem_strong
+
+# ── Data ──
+stage1_data_path: data/sparql/lcquad2_stage1_train.jsonl
+stage1_dev_path: data/sparql/lcquad2_stage1_dev.jsonl
+
+# ── LoRA / ALREM ──
+target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+r_high: 32
+r_low: 4
+r_uniform: 16
+cut_ratio_early: 0.25
+cut_ratio_mid: 0.75
+early_end: null
+mid_end: null
+lora_dropout: 0.05
+lora_alpha_mode: "2r"
+lora_alpha_fixed: null
+r_match_max: 128
+
+# ── Training ──
+learning_rate: 2e-4
+num_train_epochs: 3
+max_seq_len: 512
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_steps: -1
+grad_ckpt: true
+seed: 42
+
+# ── Logging / Checkpointing ──
+logging_steps: 10
+evaluation_strategy: steps
+eval_steps: 100
+save_strategy: steps
+save_steps: 100
+save_total_limit: 2
+
+# ── Misc ──
+max_train_samples: null
+max_eval_samples: null
+resume_from_checkpoint: null

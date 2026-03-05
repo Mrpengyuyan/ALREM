@@ -1,0 +1,13 @@
+torch
+transformers>=4.40.0
+datasets>=2.18.0
+peft>=0.10.0
+accelerate>=0.27.0
+evaluate>=0.4.1
+sacrebleu>=2.4.0
+pyyaml>=6.0.1
+numpy>=1.24.0
+sentencepiece>=0.2.0
+SPARQLWrapper>=2.0.0
+langdetect>=1.0.9
+bitsandbytes>=0.43.0

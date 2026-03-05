@@ -1,0 +1,61 @@
+# ============================================================
+# Stage 2 — Parameter-matched LoRA on QALD-9-plus (multilingual)
+# Resumes from Stage 1 Param-matched adapter checkpoint
+# ============================================================
+model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+task: sparql
+method: matched
+quantization: "4bit"
+precision: bf16
+output_dir: outputs
+run_name: sparql_s2_param_match
+
+# ── Stage 1 checkpoint (adapter to resume from) ──
+stage1_checkpoint: outputs/sparql_s1_param_match
+
+# ── Data ──
+stage2_data_path: data/sparql/qald9plus_stage2_train.jsonl
+stage2_dev_path: data/sparql/qald9plus_stage2_dev.jsonl
+test_data_path: data/sparql/qald9plus_test.jsonl
+test_languages: ["en", "de", "fr", "ru"]
+sparql_cache_dir: data/sparql/cache
+
+# ── LoRA ──
+target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+r_high: 32
+r_low: 8
+r_uniform: 16
+cut_ratio_early: 0.25
+cut_ratio_mid: 0.75
+early_end: null
+mid_end: null
+lora_dropout: 0.05
+lora_alpha_mode: "2r"
+lora_alpha_fixed: null
+r_match_max: 128
+
+# ── Training ──
+learning_rate: 1e-4
+num_train_epochs: 5
+max_seq_len: 512
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_steps: -1
+grad_ckpt: true
+seed: 42
+
+# ── Logging / Checkpointing ──
+logging_steps: 10
+evaluation_strategy: steps
+eval_steps: 50
+save_strategy: steps
+save_steps: 50
+save_total_limit: 2
+early_stopping_patience: 5
+
+# ── Misc ──
+max_train_samples: null
+max_eval_samples: null
+resume_from_checkpoint: null
