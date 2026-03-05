@@ -17,7 +17,7 @@ stage1_checkpoint: outputs/sparql_s1_param_match
 stage2_data_path: data/sparql/qald9plus_stage2_train.jsonl
 stage2_dev_path: data/sparql/qald9plus_stage2_dev.jsonl
 test_data_path: data/sparql/qald9plus_test.jsonl
-test_languages: ["en", "de", "fr", "ru"]
+test_languages: ["en", "de", "es", "ru"]
 sparql_cache_dir: data/sparql/cache
 
 # ── LoRA ──

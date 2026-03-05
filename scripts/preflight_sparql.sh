@@ -31,7 +31,17 @@ print(f"[OK] Python version: {sys.version.split()[0]}")
 PY
 
 python - <<'PY'
-modules = ["yaml", "torch", "transformers", "datasets", "peft", "accelerate"]
+modules = [
+    "yaml",
+    "torch",
+    "transformers",
+    "datasets",
+    "peft",
+    "accelerate",
+    "SPARQLWrapper",
+    "langdetect",
+    "bitsandbytes",
+]
 missing = []
 for name in modules:
     try:

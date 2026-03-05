@@ -823,8 +823,11 @@ def _build_run_report(
             "final_eval_loss": eval_losses[-1]["eval_loss"] if eval_losses else None,
             "best_checkpoint": best_ckpt,
             "best_metric": round(best_metric, 6) if isinstance(best_metric, float) else best_metric,
-            "early_stopped": getattr(trainer.state, "global_step", 0) < (
-                int(train_metrics.get("train_steps", 0)) if train_metrics.get("train_steps") else 999999
+            "early_stopped": bool(
+                cfg.get("early_stopping_patience") is not None
+                and int(getattr(trainer.state, "max_steps", 0) or 0) > 0
+                and int(getattr(trainer.state, "global_step", 0) or 0)
+                < int(getattr(trainer.state, "max_steps", 0) or 0)
             ),
             "metrics": train_metrics,
         },
