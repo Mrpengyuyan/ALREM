@@ -37,6 +37,7 @@ from .lora_utils import (
     summarize_ranks,
 )
 from .prompts import FLORES_PROMPT, MGSM_PROMPT, build_sparql_train_text
+from .step_time_logging import StepTimeLoggingCallback
 from .utils import count_parameters, ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
 
 LOGGER = logging.getLogger("alrem.train_sft")
@@ -656,6 +657,18 @@ def main() -> None:
 
     # ── Callbacks ──
     callbacks = []
+    step_time_log_interval = _cfg_int(
+        cfg,
+        "step_time_log_interval",
+        default=eval_steps if eval_steps > 0 else 10,
+    )
+    if step_time_log_interval > 0:
+        callbacks.append(
+            StepTimeLoggingCallback(
+                interval_steps=step_time_log_interval,
+                logger=logger,
+            )
+        )
     if early_stopping_patience is not None:
         callbacks.append(EarlyStoppingCallback(
             early_stopping_patience=int(early_stopping_patience)

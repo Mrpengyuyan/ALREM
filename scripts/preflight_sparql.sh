@@ -38,9 +38,6 @@ modules = [
     "datasets",
     "peft",
     "accelerate",
-    "SPARQLWrapper",
-    "langdetect",
-    "bitsandbytes",
 ]
 missing = []
 for name in modules:
@@ -111,6 +108,43 @@ task = str(cfg.get("task", "")).strip().lower()
 if task != "sparql":
     fail(f"Expected task=sparql, got task={task!r}")
 info("task=sparql")
+
+# Dependency checks that depend on config.
+required_modules = []
+optional_modules = []
+
+quantization = str(cfg.get("quantization", "")).strip().lower()
+if quantization == "4bit":
+    required_modules.append("bitsandbytes")
+
+# SPARQLWrapper/langdetect are needed by prepare/eval/data tooling, but not
+# always required for pure training-only smoke checks.
+optional_modules.extend(["SPARQLWrapper", "langdetect"])
+
+missing_required = []
+for mod in required_modules:
+    try:
+        __import__(mod)
+    except Exception:
+        missing_required.append(mod)
+if missing_required:
+    fail("Missing config-required Python packages: " + ", ".join(missing_required))
+if required_modules:
+    info(f"Config-required packages are available: {required_modules}")
+
+missing_optional = []
+for mod in optional_modules:
+    try:
+        __import__(mod)
+    except Exception:
+        missing_optional.append(mod)
+if missing_optional:
+    warn(
+        "Optional packages are missing (needed for data preparation / SPARQL execution paths): "
+        + ", ".join(missing_optional)
+    )
+else:
+    info("Optional SPARQL/data packages are available.")
 
 is_stage2 = bool(cfg.get("stage1_checkpoint"))
 if is_stage2:
