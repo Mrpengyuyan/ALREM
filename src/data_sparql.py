@@ -15,7 +15,16 @@ SYSTEM_PROMPT = (
     "generate the corresponding SPARQL query. Output ONLY the SPARQL query, nothing else."
 )
 
-DEFAULT_QALD_TEST_LANGUAGES = ["en", "de", "fr", "ru"]
+DEFAULT_QALD_TEST_LANGUAGES = ["en", "de", "es", "ru"]
+
+_PREPARED_OUTPUT_FILES = {
+    "lcquad2_stage1_train.jsonl",
+    "lcquad2_stage1_dev.jsonl",
+    "qald9plus_stage2_train.jsonl",
+    "qald9plus_stage2_dev.jsonl",
+    "qald9plus_test.jsonl",
+    "qald9plus_high_stakes_test.jsonl",
+}
 
 _SPARQL_PATTERN = re.compile(r"\b(SELECT|ASK|CONSTRUCT|DESCRIBE)\b", flags=re.IGNORECASE)
 
@@ -141,6 +150,19 @@ def _find_candidate_files(path: Path, file_patterns: Sequence[str]) -> List[Path
     return found
 
 
+def _filter_prepared_artifacts(files: Sequence[Path]) -> List[Path]:
+    filtered: List[Path] = []
+    skipped = 0
+    for file_path in files:
+        if file_path.name.lower() in _PREPARED_OUTPUT_FILES:
+            skipped += 1
+            continue
+        filtered.append(file_path)
+    if skipped:
+        LOGGER.info("Ignored %d prepared output file(s) when scanning local raw data.", skipped)
+    return filtered
+
+
 def _extract_lcquad_fields(record: Dict[str, Any]) -> Optional[Dict[str, str]]:
     question_keys = [
         "corrected_question",
@@ -247,6 +269,7 @@ def load_lcquad2_from_local(path: str) -> List[Dict[str, str]]:
         "*test-data-answer*.json",
     ]
     files = _find_candidate_files(path_obj, primary_patterns)
+    files = _filter_prepared_artifacts(files)
     if not files:
         raise FileNotFoundError(
             "No LC-QuAD-like JSON/JSONL files found. "
@@ -571,6 +594,7 @@ def load_qald9plus_from_local(path: str) -> Dict[str, Any]:
         "*qald*.json",
     ]
     files = _find_candidate_files(path_obj, primary_patterns)
+    files = _filter_prepared_artifacts(files)
     if not files:
         raise FileNotFoundError(
             "No QALD-like JSON/JSONL files found. "

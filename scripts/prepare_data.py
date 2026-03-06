@@ -81,6 +81,43 @@ def _print_stats(logger: logging.Logger, stats: Dict[str, Any]) -> None:
     logger.info("=============================================")
 
 
+def _collect_unique_sparql_queries(records: List[Dict[str, Any]]) -> List[str]:
+    unique: List[str] = []
+    seen = set()
+    for item in records:
+        query = str(item.get("sparql", "")).strip()
+        if not query or query in seen:
+            continue
+        seen.add(query)
+        unique.append(query)
+    return unique
+
+
+def _validate_gold_cache_offline(
+    cache: SPARQLCache,
+    records: List[Dict[str, Any]],
+    logger: logging.Logger,
+    max_report: int = 5,
+) -> None:
+    queries = _collect_unique_sparql_queries(records)
+    logger.info("Offline cache validation for %d unique gold SPARQL queries.", len(queries))
+    missing: List[str] = []
+    for query in queries:
+        try:
+            cache.execute(query, offline_only=True)
+        except FileNotFoundError:
+            missing.append(query)
+    if missing:
+        preview = "\n".join(f"- {q[:200]}" for q in missing[:max_report])
+        raise RuntimeError(
+            "offline_only=True but gold SPARQL cache is incomplete.\n"
+            f"Missing cache entries: {len(missing)} / {len(queries)}\n"
+            f"Examples:\n{preview}\n"
+            "Please run prepare_data.py once without --offline-only to pre-cache gold queries."
+        )
+    logger.info("Offline cache validation passed (all gold queries cached).")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare LC-QuAD 2.0 + QALD-9-plus data for ALREM experiments.")
     parser.add_argument(
@@ -113,8 +150,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--qald-test-languages",
         type=str,
-        default="en,de,fr,ru",
-        help="Comma-separated language list for QALD test (default: en,de,fr,ru).",
+        default="en,de,es,ru",
+        help="Comma-separated language list for QALD test (default: en,de,es,ru).",
     )
     parser.add_argument(
         "--cache-dir",
@@ -188,11 +225,26 @@ def main() -> None:
 
     # 5) Pre-cache gold SPARQL results.
     cache = SPARQLCache(cache_dir=str(cache_dir), force_offline=args.offline_only)
-    gold_queries = qald_train + qald_dev + qald_test
-    cache.pre_cache_gold(gold_queries)
+    gold_records = qald_train + qald_dev + qald_test
+    if args.offline_only:
+        _validate_gold_cache_offline(cache=cache, records=gold_records, logger=logger)
+    else:
+        cache.pre_cache_gold(gold_records)
 
     # 6) Build legal/medical high-stakes subset for stress-test case study.
-    high_stakes = filter_high_stakes_subset(qald_test, cache=cache)
+    high_stakes_status = "ok"
+    try:
+        high_stakes = filter_high_stakes_subset(qald_test, cache=cache)
+    except FileNotFoundError as exc:
+        if args.offline_only:
+            logger.warning(
+                "Skip high-stakes subset construction in offline mode due to missing cache: %s",
+                exc,
+            )
+            high_stakes = []
+            high_stakes_status = "skipped_offline_cache_miss"
+        else:
+            raise
     high_stakes_path = output_dir / "qald9plus_high_stakes_test.jsonl"
     _write_jsonl(high_stakes, high_stakes_path)
 
@@ -207,6 +259,7 @@ def main() -> None:
         "qald_dev_languages": _language_distribution(qald_dev),
         "qald_test_languages": _language_distribution(qald_test),
         "qald_high_stakes_samples": len(high_stakes),
+        "qald_high_stakes_status": high_stakes_status,
         "output_files": [
             str(lcquad_train_path),
             str(lcquad_dev_path),

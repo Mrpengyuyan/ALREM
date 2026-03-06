@@ -37,6 +37,7 @@ from .lora_utils import (
     summarize_ranks,
 )
 from .prompts import FLORES_PROMPT, MGSM_PROMPT, build_sparql_train_text
+from .step_time_logging import StepTimeLoggingCallback
 from .utils import count_parameters, ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
 
 LOGGER = logging.getLogger("alrem.train_sft")
@@ -656,6 +657,18 @@ def main() -> None:
 
     # ── Callbacks ──
     callbacks = []
+    step_time_log_interval = _cfg_int(
+        cfg,
+        "step_time_log_interval",
+        default=eval_steps if eval_steps > 0 else 10,
+    )
+    if step_time_log_interval > 0:
+        callbacks.append(
+            StepTimeLoggingCallback(
+                interval_steps=step_time_log_interval,
+                logger=logger,
+            )
+        )
     if early_stopping_patience is not None:
         callbacks.append(EarlyStoppingCallback(
             early_stopping_patience=int(early_stopping_patience)
@@ -823,8 +836,11 @@ def _build_run_report(
             "final_eval_loss": eval_losses[-1]["eval_loss"] if eval_losses else None,
             "best_checkpoint": best_ckpt,
             "best_metric": round(best_metric, 6) if isinstance(best_metric, float) else best_metric,
-            "early_stopped": getattr(trainer.state, "global_step", 0) < (
-                int(train_metrics.get("train_steps", 0)) if train_metrics.get("train_steps") else 999999
+            "early_stopped": bool(
+                cfg.get("early_stopping_patience") is not None
+                and int(getattr(trainer.state, "max_steps", 0) or 0) > 0
+                and int(getattr(trainer.state, "global_step", 0) or 0)
+                < int(getattr(trainer.state, "max_steps", 0) or 0)
             ),
             "metrics": train_metrics,
         },

@@ -5,8 +5,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from SPARQLWrapper import JSON, SPARQLWrapper
-
 LOGGER = logging.getLogger("alrem.sparql_executor")
 
 
@@ -82,6 +80,13 @@ class SPARQLCache:
             time.sleep(remaining)
 
     def _remote_query(self, sparql_query: str) -> Dict[str, Any]:
+        try:
+            from SPARQLWrapper import JSON, SPARQLWrapper
+        except Exception as exc:
+            raise ImportError(
+                "SPARQLWrapper is required for remote SPARQL execution. "
+                "Install it via requirements.txt or run in offline cache mode."
+            ) from exc
         self._respect_rate_limit()
         wrapper = SPARQLWrapper(self.endpoint, agent="ALREM-SPARQLCache/1.0")
         wrapper.setQuery(sparql_query)

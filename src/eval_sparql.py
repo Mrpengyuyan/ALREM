@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from .prompts import build_sparql_infer_text
 from .sparql_executor import SPARQLCache
@@ -75,6 +73,14 @@ def _normalize_sparql(sparql: str) -> str:
     return text
 
 
+def _parse_language_list(csv_text: Optional[str]) -> Optional[List[str]]:
+    if csv_text is None:
+        return None
+    tokens = [token.strip().lower() for token in csv_text.split(",")]
+    langs = [token for token in tokens if token]
+    return langs if langs else None
+
+
 # ── Model loading ────────────────────────────────────────────────────────────
 
 def load_model_for_eval(
@@ -84,6 +90,9 @@ def load_model_for_eval(
     precision: str = "bf16",
 ) -> Tuple[Any, Any]:
     """Load base model + adapter for inference."""
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
     torch_dtype = torch.bfloat16 if precision == "bf16" else (
         torch.float16 if precision == "fp16" else None
     )
@@ -156,6 +165,8 @@ def generate_sparql(
     few_shot_examples: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Generate a SPARQL query for a single question."""
+    from transformers import GenerationConfig
+
     prompt = build_sparql_infer_text(question, tokenizer, few_shot_examples)
     # Prompt already contains chat-template special tokens.
     inputs = tokenizer(
@@ -269,6 +280,8 @@ def _execute_and_compare(
             result["gold_executable"] = True
             result["gold_answers"] = gold_result.get("normalized_answers", [])
     except FileNotFoundError:
+        if offline_only:
+            raise
         LOGGER.debug("Gold SPARQL cache miss (offline): %s...", gold_sparql[:80])
     except Exception as exc:
         LOGGER.debug("Gold SPARQL execution error: %s", exc)
@@ -283,6 +296,8 @@ def _execute_and_compare(
         else:
             result["error_type"] = "execution_error"
     except FileNotFoundError:
+        if offline_only:
+            raise
         result["error_type"] = "cache_miss"
         LOGGER.debug("Pred SPARQL cache miss (offline): %s...", pred_sparql[:80])
     except Exception as exc:
@@ -435,9 +450,17 @@ def compute_all_metrics(
     )
 
     for r in results:
-        exec_info = _execute_and_compare(
-            r["pred_sparql"], r["gold_sparql"], cache, offline_only
-        )
+        try:
+            exec_info = _execute_and_compare(
+                r["pred_sparql"], r["gold_sparql"], cache, offline_only
+            )
+        except FileNotFoundError as exc:
+            qid = str(r.get("qid", "")).strip() or "<no-qid>"
+            lang = str(r.get("language", "")).strip() or "unk"
+            raise RuntimeError(
+                "Offline evaluation cache miss detected. "
+                f"qid={qid}, language={lang}. {exc}"
+            ) from exc
         r["exec_info"] = exec_info  # attach for CLC
 
         lang = r.get("language", "unk")
@@ -536,6 +559,12 @@ def parse_eval_args() -> argparse.Namespace:
                         help="Max tokens to generate per query.")
     parser.add_argument("--quantization", type=str, default=None,
                         help="Quantization mode (4bit or none).")
+    parser.add_argument(
+        "--test_languages",
+        type=str,
+        default=None,
+        help="Comma-separated language filter for evaluation (e.g., en,de,es,ru).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -559,6 +588,11 @@ def main() -> None:
     output_dir = args.output_dir or os.path.join(adapter_path, "eval_results")
     offline_only = args.offline_only or cfg.get("offline_only", False)
     quantization = args.quantization or cfg.get("quantization", "4bit")
+    test_languages = _parse_language_list(args.test_languages)
+    if test_languages is None:
+        cfg_languages = cfg.get("test_languages")
+        if isinstance(cfg_languages, list):
+            test_languages = [str(lang).strip().lower() for lang in cfg_languages if str(lang).strip()]
     seed = args.seed
 
     if not model_name:
@@ -583,6 +617,19 @@ def main() -> None:
     test_data = _load_jsonl(test_data_path)
     if args.max_samples:
         test_data = test_data[: args.max_samples]
+    if test_languages:
+        allowed = set(test_languages)
+        before = len(test_data)
+        test_data = [
+            sample for sample in test_data
+            if str(sample.get("language", "unk")).strip().lower() in allowed
+        ]
+        logger.info(
+            "Applied test language filter %s: %d -> %d samples",
+            sorted(allowed),
+            before,
+            len(test_data),
+        )
     logger.info("Test samples: %d", len(test_data))
     if len(test_data) == 0:
         raise ValueError(f"No test samples loaded from: {test_data_path}")

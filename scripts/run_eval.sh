@@ -43,6 +43,9 @@ fi
 if [ -n "${MAX_SAMPLES:-}" ]; then
     CMD+=(--max_samples "${MAX_SAMPLES}")
 fi
+if [ -n "${TEST_LANGUAGES:-}" ]; then
+    CMD+=(--test_languages "${TEST_LANGUAGES}")
+fi
 if [ "${OFFLINE_ONLY:-false}" = "true" ]; then
     CMD+=(--offline_only)
 fi
