@@ -112,10 +112,37 @@ Override Stage1 checkpoint when needed:
 STAGE1_CKPT=outputs/sparql_s1_alrem bash scripts/run_stage2.sh
 ```
 
-### 5) Evaluation
+### 5) ICL baselines (task-level baseline)
+
+Zero-shot:
+
+```bash
+bash scripts/run_icl.sh
+```
+
+Few-shot:
+
+```bash
+CONFIG=configs/sparql_icl_few_shot.yaml bash scripts/run_icl.sh
+```
+
+Windows PowerShell (no bash):
+
+```powershell
+python -m src.run_icl_baseline --config configs/sparql_icl_zero_shot.yaml
+python -m src.run_icl_baseline --config configs/sparql_icl_few_shot.yaml
+```
+
+### 6) Evaluation
 
 ```bash
 bash scripts/run_eval.sh
+```
+
+Windows PowerShell (no bash):
+
+```powershell
+python -m src.eval_sparql --config configs/sparql_stage2_alrem.yaml
 ```
 
 Optional overrides:
@@ -128,7 +155,16 @@ OFFLINE_ONLY=true \
 bash scripts/run_eval.sh
 ```
 
-### 6) Minimal smoke test
+Evaluate existing predictions (shared eval outlet for ICL/adapter):
+
+```bash
+PREDICTIONS_FILE=outputs/sparql_icl_zero/predictions.jsonl \
+CACHE_DIR=data/sparql/cache \
+OFFLINE_ONLY=true \
+bash scripts/run_eval.sh
+```
+
+### 7) Minimal smoke test
 
 ```bash
 CONFIG=configs/sparql_stage1_alrem.yaml RUN_NAME=smoke_s1 MAX_TRAIN=32 MAX_EVAL=16 bash scripts/run_stage1.sh
@@ -150,6 +186,10 @@ Stage2:
 - `configs/sparql_stage2_alrem.yaml`
 - `configs/sparql_stage2_alrem_strong.yaml`
 - `configs/sparql_stage2_reverse_sandwich.yaml`
+
+ICL:
+- `configs/sparql_icl_zero_shot.yaml`
+- `configs/sparql_icl_few_shot.yaml`
 
 Important:
 - Do not mix Stage1 and Stage2 checkpoints from different base models.

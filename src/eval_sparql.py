@@ -81,6 +81,77 @@ def _parse_language_list(csv_text: Optional[str]) -> Optional[List[str]]:
     return langs if langs else None
 
 
+def _filter_by_languages(
+    records: List[Dict[str, Any]],
+    test_languages: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    if not test_languages:
+        return records
+    allowed = set(test_languages)
+    return [
+        sample
+        for sample in records
+        if str(sample.get("language", "unk")).strip().lower() in allowed
+    ]
+
+
+def _to_str_or_empty(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _normalize_prediction_record(record: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+    gold_sparql = _to_str_or_empty(record.get("gold_sparql"))
+    if not gold_sparql:
+        gold_sparql = _to_str_or_empty(record.get("sparql"))
+    pred_sparql = _to_str_or_empty(record.get("pred_sparql"))
+    if not pred_sparql:
+        pred_sparql = _to_str_or_empty(record.get("prediction"))
+    if not gold_sparql:
+        LOGGER.warning("Skip prediction #%d: missing gold SPARQL", idx)
+        return None
+
+    try:
+        generation_time = float(record.get("generation_time_sec", 0.0))
+    except (TypeError, ValueError):
+        generation_time = 0.0
+
+    try:
+        norm_idx = int(record.get("idx", idx))
+    except (TypeError, ValueError):
+        norm_idx = idx
+
+    normalized: Dict[str, Any] = {
+        "idx": norm_idx,
+        "qid": _to_str_or_empty(record.get("qid")) or _to_str_or_empty(record.get("id")),
+        "language": _to_str_or_empty(record.get("language")) or "unk",
+        "question": _to_str_or_empty(record.get("question")),
+        "gold_sparql": gold_sparql,
+        "pred_sparql": pred_sparql,
+        "generation_time_sec": round(generation_time, 3),
+    }
+    if "mode" in record:
+        normalized["mode"] = str(record.get("mode", "")).strip()
+    return normalized
+
+
+def _load_predictions_jsonl(path: str) -> List[Dict[str, Any]]:
+    raw_records = _load_jsonl(path)
+    normalized: List[Dict[str, Any]] = []
+    for idx, record in enumerate(raw_records):
+        normalized_record = _normalize_prediction_record(record, idx)
+        if normalized_record is None:
+            continue
+        normalized.append(normalized_record)
+    if not normalized:
+        raise ValueError(
+            f"No valid prediction records loaded from {path}. "
+            "Expected fields include gold_sparql and pred_sparql (or prediction)."
+        )
+    return normalized
+
+
 # ── Model loading ────────────────────────────────────────────────────────────
 
 def load_model_for_eval(
@@ -161,7 +232,11 @@ def generate_sparql(
     model,
     tokenizer,
     question: str,
+    max_seq_len: int = 512,
     max_new_tokens: int = 256,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
     few_shot_examples: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     """Generate a SPARQL query for a single question."""
@@ -173,7 +248,7 @@ def generate_sparql(
         prompt,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=max_seq_len,
         add_special_tokens=False,
     )
     input_device = _infer_generation_device(model)
@@ -181,9 +256,9 @@ def generate_sparql(
 
     gen_config = GenerationConfig(
         max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=1.0,
-        top_p=1.0,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
@@ -202,7 +277,11 @@ def batch_generate(
     model,
     tokenizer,
     test_data: List[Dict[str, Any]],
+    max_seq_len: int = 512,
     max_new_tokens: int = 256,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
     few_shot_examples: Optional[List[Dict[str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Generate SPARQL for all test samples."""
@@ -222,7 +301,11 @@ def batch_generate(
         start_time = time.monotonic()
         pred_sparql = generate_sparql(
             model, tokenizer, question,
+            max_seq_len=max_seq_len,
             max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
             few_shot_examples=few_shot_examples,
         )
         elapsed = time.monotonic() - start_time
@@ -541,6 +624,8 @@ def parse_eval_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate SPARQL generation.")
     parser.add_argument("--config", type=str, default=None,
                         help="Training config YAML (reads model/data paths from it).")
+    parser.add_argument("--predictions_file", type=str, default=None,
+                        help="Path to an existing predictions JSONL to evaluate only.")
     parser.add_argument("--adapter_path", type=str, default=None,
                         help="Path to trained adapter (overrides config).")
     parser.add_argument("--model_name", type=str, default=None,
@@ -555,8 +640,16 @@ def parse_eval_args() -> argparse.Namespace:
                         help="Only use cached SPARQL results, never query endpoint.")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of test samples.")
-    parser.add_argument("--max_new_tokens", type=int, default=256,
+    parser.add_argument("--max_new_tokens", type=int, default=None,
                         help="Max tokens to generate per query.")
+    parser.add_argument("--max_seq_len", type=int, default=None,
+                        help="Max input sequence length for prompt tokenization.")
+    parser.add_argument("--do_sample", action="store_true",
+                        help="Use sampling for generation.")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="Sampling temperature (used when do_sample=True).")
+    parser.add_argument("--top_p", type=float, default=None,
+                        help="Sampling top-p (used when do_sample=True).")
     parser.add_argument("--quantization", type=str, default=None,
                         help="Quantization mode (4bit or none).")
     parser.add_argument(
@@ -578,16 +671,29 @@ def main() -> None:
         cfg = load_yaml(args.config)
 
     # Resolve parameters (CLI overrides config)
+    predictions_file = args.predictions_file or cfg.get("predictions_file")
     model_name = args.model_name or cfg.get("model_name_or_path")
-    adapter_path = args.adapter_path or os.path.join(
-        cfg.get("output_dir", "outputs"),
-        cfg.get("run_name", "run"),
-    )
+    adapter_path = args.adapter_path or cfg.get("adapter_path")
+    if not adapter_path:
+        adapter_path = os.path.join(
+            cfg.get("output_dir", "outputs"),
+            cfg.get("run_name", "run"),
+        )
     test_data_path = args.test_data or cfg.get("test_data_path")
     cache_dir = args.cache_dir or cfg.get("sparql_cache_dir", "data/sparql/cache")
-    output_dir = args.output_dir or os.path.join(adapter_path, "eval_results")
+    if args.output_dir:
+        output_dir = args.output_dir
+    elif predictions_file:
+        output_dir = str(Path(predictions_file).resolve().parent / "eval_results")
+    else:
+        output_dir = os.path.join(adapter_path, "eval_results")
     offline_only = args.offline_only or cfg.get("offline_only", False)
     quantization = args.quantization or cfg.get("quantization", "4bit")
+    max_seq_len = int(args.max_seq_len if args.max_seq_len is not None else cfg.get("max_seq_len", 512))
+    max_new_tokens = int(args.max_new_tokens if args.max_new_tokens is not None else cfg.get("max_new_tokens", 256))
+    do_sample = bool(args.do_sample or cfg.get("do_sample", False))
+    temperature = float(args.temperature if args.temperature is not None else cfg.get("temperature", 1.0))
+    top_p = float(args.top_p if args.top_p is not None else cfg.get("top_p", 1.0))
     test_languages = _parse_language_list(args.test_languages)
     if test_languages is None:
         cfg_languages = cfg.get("test_languages")
@@ -595,60 +701,93 @@ def main() -> None:
             test_languages = [str(lang).strip().lower() for lang in cfg_languages if str(lang).strip()]
     seed = args.seed
 
-    if not model_name:
-        raise ValueError("model_name is required (via --model_name or config).")
-    if not test_data_path:
-        raise ValueError("test_data is required (via --test_data or config test_data_path).")
-    if not Path(test_data_path).exists():
-        raise FileNotFoundError(f"Test data not found: {test_data_path}")
+    if not predictions_file:
+        if not model_name:
+            raise ValueError("model_name is required (via --model_name or config).")
+        if not test_data_path:
+            raise ValueError("test_data is required (via --test_data or config test_data_path).")
+        if not Path(test_data_path).exists():
+            raise FileNotFoundError(f"Test data not found: {test_data_path}")
+    elif not Path(predictions_file).exists():
+        raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
 
     ensure_dir(output_dir)
     logger = setup_logging(os.path.join(output_dir, "eval.log"), logger_name="alrem")
     set_seed(seed)
 
-    logger.info("Model: %s", model_name)
-    logger.info("Adapter: %s", adapter_path)
-    logger.info("Test data: %s", test_data_path)
+    logger.info("Predictions file mode: %s", bool(predictions_file))
+    if predictions_file:
+        logger.info("Predictions file: %s", predictions_file)
+    else:
+        logger.info("Model: %s", model_name)
+        logger.info("Adapter: %s", adapter_path)
+        logger.info("Test data: %s", test_data_path)
     logger.info("Cache dir: %s", cache_dir)
     logger.info("Offline only: %s", offline_only)
     logger.info("Output dir: %s", output_dir)
+    logger.info(
+        "Decoding: max_seq_len=%d max_new_tokens=%d do_sample=%s temperature=%.3f top_p=%.3f",
+        max_seq_len,
+        max_new_tokens,
+        do_sample,
+        temperature,
+        top_p,
+    )
 
-    # Load test data
-    test_data = _load_jsonl(test_data_path)
-    if args.max_samples:
-        test_data = test_data[: args.max_samples]
-    if test_languages:
-        allowed = set(test_languages)
+    results: List[Dict[str, Any]]
+    if predictions_file:
+        results = _load_predictions_jsonl(predictions_file)
+        logger.info("Loaded %d predictions from file", len(results))
+        if args.max_samples:
+            results = results[: args.max_samples]
+        before = len(results)
+        results = _filter_by_languages(results, test_languages)
+        if test_languages:
+            logger.info(
+                "Applied prediction language filter %s: %d -> %d samples",
+                sorted(set(test_languages)),
+                before,
+                len(results),
+            )
+        if not results:
+            raise ValueError("No prediction samples left after filtering.")
+    else:
+        # Load test data
+        test_data = _load_jsonl(test_data_path)
+        if args.max_samples:
+            test_data = test_data[: args.max_samples]
         before = len(test_data)
-        test_data = [
-            sample for sample in test_data
-            if str(sample.get("language", "unk")).strip().lower() in allowed
-        ]
-        logger.info(
-            "Applied test language filter %s: %d -> %d samples",
-            sorted(allowed),
-            before,
-            len(test_data),
+        test_data = _filter_by_languages(test_data, test_languages)
+        if test_languages:
+            logger.info(
+                "Applied test language filter %s: %d -> %d samples",
+                sorted(set(test_languages)),
+                before,
+                len(test_data),
+            )
+        logger.info("Test samples: %d", len(test_data))
+        if len(test_data) == 0:
+            raise ValueError(f"No test samples loaded from: {test_data_path}")
+
+        # Load model
+        model, tokenizer = load_model_for_eval(
+            model_name=model_name,
+            adapter_path=adapter_path,
+            quantization=quantization,
+            precision=cfg.get("precision", "bf16"),
         )
-    logger.info("Test samples: %d", len(test_data))
-    if len(test_data) == 0:
-        raise ValueError(f"No test samples loaded from: {test_data_path}")
 
-    # Load model
-    model, tokenizer = load_model_for_eval(
-        model_name=model_name,
-        adapter_path=adapter_path,
-        quantization=quantization,
-        precision=cfg.get("precision", "bf16"),
-    )
-
-    # Generate
-    logger.info("Starting generation...")
-    results = batch_generate(
-        model, tokenizer, test_data,
-        max_new_tokens=args.max_new_tokens,
-    )
-    logger.info("Generation complete: %d results", len(results))
+        # Generate
+        logger.info("Starting generation...")
+        results = batch_generate(
+            model, tokenizer, test_data,
+            max_seq_len=max_seq_len,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        logger.info("Generation complete: %d results", len(results))
 
     # Save raw predictions
     preds_path = os.path.join(output_dir, "predictions.jsonl")

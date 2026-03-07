@@ -1,0 +1,29 @@
+# ============================================================
+# ICL baseline: few-shot
+# Generates predictions.jsonl (no adapter training/loading)
+# ============================================================
+model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+task: sparql
+icl_mode: few
+
+# Data
+test_data_path: data/sparql/qald9plus_test.jsonl
+few_shot_pool_path: data/sparql/qald9plus_stage2_train.jsonl
+few_shot_k: 4
+few_shot_seed: 42
+test_languages: ["en", "de", "es", "ru"]
+sparql_cache_dir: data/sparql/cache
+
+# Output
+output_dir: outputs
+run_name: sparql_icl_fewshot_k4
+
+# Inference
+quantization: "4bit"
+precision: bf16
+max_seq_len: 512
+max_new_tokens: 256
+do_sample: false
+temperature: 1.0
+top_p: 1.0
+seed: 42

@@ -58,6 +58,7 @@ else
 fi
 
 python - "${CONFIG_PATH}" <<'PY'
+import json
 import sys
 from pathlib import Path
 
@@ -75,6 +76,14 @@ def info(msg: str) -> None:
 
 def warn(msg: str) -> None:
     print(f"[WARN] {msg}")
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
 
 common_keys = [
     "model_name_or_path",
@@ -155,7 +164,6 @@ if is_stage2:
         "test_data_path",
         "test_languages",
         "sparql_cache_dir",
-        "early_stopping_patience",
     ]
     missing = [k for k in stage_keys if k not in cfg]
     if missing:
@@ -167,6 +175,10 @@ if is_stage2:
     adapter_cfg = ckpt_dir / "adapter_config.json"
     if not adapter_cfg.exists():
         fail(f"Missing adapter_config.json under checkpoint: {adapter_cfg}")
+    try:
+        adapter_meta = json.loads(adapter_cfg.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"Failed to parse adapter_config.json: {adapter_cfg} ({exc})")
 
     for key in ("stage2_data_path", "stage2_dev_path", "test_data_path"):
         p = root / str(cfg[key])
@@ -176,6 +188,39 @@ if is_stage2:
     cache_dir = root / str(cfg["sparql_cache_dir"])
     if not cache_dir.exists():
         warn(f"Cache dir does not exist yet: {cache_dir} (allowed, but slower for first run)")
+
+    # Basic adapter/config compatibility checks (fail-fast before training).
+    cfg_model = str(cfg.get("model_name_or_path", "")).strip()
+    adapter_model = str(adapter_meta.get("base_model_name_or_path", "")).strip()
+    if cfg_model and adapter_model and cfg_model != adapter_model:
+        fail(
+            "Stage2 base model mismatch with Stage1 adapter. "
+            f"config={cfg_model} adapter={adapter_model}"
+        )
+
+    cfg_modules = [str(x).strip() for x in as_list(cfg.get("target_modules")) if str(x).strip()]
+    adapter_modules = [str(x).strip() for x in as_list(adapter_meta.get("target_modules")) if str(x).strip()]
+    if cfg_modules and adapter_modules and set(cfg_modules) != set(adapter_modules):
+        fail(
+            "Stage2 target_modules mismatch with Stage1 adapter. "
+            f"config={sorted(cfg_modules)} adapter={sorted(adapter_modules)}"
+        )
+
+    method = str(cfg.get("method", "alrem")).strip().lower()
+    if method == "alrem":
+        if not adapter_meta.get("rank_pattern"):
+            fail("Stage2 method=alrem requires a Stage1 adapter with rank_pattern.")
+    elif method == "uniform":
+        adapter_r = adapter_meta.get("r")
+        cfg_r = cfg.get("r_uniform")
+        if adapter_r is not None and cfg_r is not None and int(adapter_r) != int(cfg_r):
+            fail(f"Stage2 uniform rank mismatch: adapter r={adapter_r} config r_uniform={cfg_r}")
+    elif method == "matched":
+        if adapter_meta.get("r") is None:
+            warn("Stage1 adapter has no explicit rank field; matched-rank preflight cannot be validated.")
+    else:
+        warn(f"Unknown method={method}; skipped method-specific adapter compatibility checks.")
+
     info("Stage2 paths and checkpoint validated.")
 else:
     stage_keys = ["stage1_data_path", "stage1_dev_path"]
