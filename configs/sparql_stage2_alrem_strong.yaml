@@ -22,6 +22,7 @@ stage2_dev_path: data/sparql/qald9plus_stage2_dev.jsonl
 test_data_path: data/sparql/qald9plus_test.jsonl
 test_languages: ["en", "de", "es", "ru"]
 sparql_cache_dir: data/sparql/cache
+eval_protocol_path: configs/sparql_eval_shared.yaml
 
 # ── LoRA / ALREM ──
 target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

@@ -1,0 +1,38 @@
+# Shared evaluation protocol for multilingual Text-to-SPARQL.
+# Adapter and ICL runs must follow this file for fair comparison.
+
+protocol_name: sparql_eval_shared
+protocol_version: v1
+protocol_id: sparql_eval_shared:v1
+task: sparql
+enforce_protocol: true
+strict_schema: true
+main_table_protocol: true
+result_partition: unified_codechain
+
+# Unified evaluation data scope
+test_data_path: data/sparql/qald9plus_test.jsonl
+test_languages: ["en", "de", "es", "ru"]
+
+# Unified decoding configuration
+max_seq_len: 512
+max_new_tokens: 256
+do_sample: false
+temperature: 1.0
+top_p: 1.0
+
+# Unified execution/cache behavior
+cache_dir: data/sparql/cache
+offline_only: true
+fail_on_cache_miss: true
+
+# Reporting schema
+allowed_modes: ["adapter", "icl_zero", "icl_fewshot"]
+allowed_error_types:
+  - generation_empty
+  - syntax_or_parse_error
+  - execution_error
+  - wrong_answer
+
+primary_metrics: ["EA", "ER", "CLC-Ans", "CLC-Struct"]
+aux_metrics: ["NormEM", "AnswerF1"]

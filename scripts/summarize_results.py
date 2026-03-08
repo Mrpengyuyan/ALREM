@@ -1,154 +1,300 @@
 import argparse
 import json
 import os
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import yaml
 
-
-def load_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_yaml(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+ALLOWED_RESULT_PARTITIONS = {
+    "unified_codechain",
+    "external_reproduced",
+    "external_reported",
+}
 
 
-def scan_runs(outputs_dir: str) -> List[Dict[str, Any]]:
-    runs: List[Dict[str, Any]] = []
-    for name in sorted(os.listdir(outputs_dir)):
-        run_dir = os.path.join(outputs_dir, name)
-        if not os.path.isdir(run_dir):
-            continue
-        metrics_path = os.path.join(run_dir, "metrics.json")
-        params_path = os.path.join(run_dir, "params.json")
-        config_path = os.path.join(run_dir, "config.yaml")
-        if not os.path.exists(metrics_path) or not os.path.exists(config_path):
-            continue
-        metrics = load_json(metrics_path)
-        params = load_json(params_path) if os.path.exists(params_path) else {}
-        cfg = load_yaml(config_path)
-        runs.append({"name": name, "dir": run_dir, "metrics": metrics, "params": params, "cfg": cfg})
-    return runs
+def _load_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 
-def write_markdown_table(headers: List[str], rows: List[List[Any]], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("| " + " | ".join(headers) + " |\n")
-        f.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+def _load_yaml(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _write_markdown_table(headers: List[str], rows: List[List[Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("| " + " | ".join(headers) + " |\n")
+        handle.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
         for row in rows:
-            f.write("| " + " | ".join(str(x) for x in row) + " |\n")
+            handle.write("| " + " | ".join(str(x) for x in row) + " |\n")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Summarize ALREM results.")
-    parser.add_argument("--outputs_dir", required=True, type=str)
-    parser.add_argument("--out_dir", required=True, type=str)
-    args = parser.parse_args()
+def _find_metric_files(outputs_dir: Path) -> List[Path]:
+    metric_paths: List[Path] = []
+    for root, _, files in os.walk(outputs_dir):
+        if "metrics.json" in files:
+            metric_paths.append(Path(root) / "metrics.json")
+    return sorted(metric_paths)
 
-    os.makedirs(args.out_dir, exist_ok=True)
-    runs = scan_runs(args.outputs_dir)
 
+def _infer_run_root(metrics_path: Path) -> Path:
+    if metrics_path.parent.name == "eval_results":
+        return metrics_path.parent.parent
+    return metrics_path.parent
+
+
+def _infer_stage(run_name: str) -> str:
+    lowered = run_name.lower()
+    if "stage1" in lowered or "_s1" in lowered or lowered.startswith("s1"):
+        return "stage1"
+    if "stage2" in lowered or "_s2" in lowered or lowered.startswith("s2"):
+        return "stage2"
+    if "icl" in lowered:
+        return "icl"
+    return "unknown"
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _infer_alrem_variant(
+    lowered_run_tokens: str,
+    cfg: Dict[str, Any],
+    run_report: Dict[str, Any],
+) -> str:
+    lora = run_report.get("lora", {}) or {}
+    r_high = _coerce_int(cfg.get("r_high"))
+    if r_high is None:
+        r_high = _coerce_int(lora.get("r_high"))
+    r_low = _coerce_int(cfg.get("r_low"))
+    if r_low is None:
+        r_low = _coerce_int(lora.get("r_low"))
+
+    if "reverse" in lowered_run_tokens:
+        return "reverse_sandwich"
+    if r_high is not None and r_low is not None and r_high < r_low:
+        return "reverse_sandwich"
+    if "strong" in lowered_run_tokens:
+        return "alrem_strong"
+    if r_high is not None and r_low is not None and r_high > r_low and r_low <= 4:
+        return "alrem_strong"
+    return "alrem_main"
+
+
+def _infer_method(run_name: str, cfg: Dict[str, Any], run_report: Dict[str, Any]) -> str:
+    mode = str(run_report.get("mode", "") or cfg.get("mode", "")).strip().lower()
+    if mode in {"icl_zero", "icl_fewshot"}:
+        return mode
+
+    method = str(cfg.get("method", "") or run_report.get("method", "")).strip().lower()
+    lowered = " ".join(
+        [
+            run_name.lower(),
+            str(cfg.get("run_name", "")).lower(),
+            str(run_report.get("run_name", "")).lower(),
+        ]
+    )
+    if method == "uniform":
+        return "uniform_lora"
+    if method == "matched":
+        return "parameter_matched_lora"
+    if method == "alrem":
+        return _infer_alrem_variant(lowered, cfg, run_report)
+
+    if "icl_few" in lowered:
+        return "icl_fewshot"
+    if "icl_zero" in lowered or "icl" in lowered:
+        return "icl_zero"
+    if method:
+        return method
+    return "unknown"
+
+
+def _normalize_partition(value: Any) -> str:
+    partition = str(value or "").strip().lower()
+    if not partition:
+        return "unknown"
+    if partition in ALLOWED_RESULT_PARTITIONS:
+        return partition
+    return partition
+
+
+def _infer_result_partition(
+    metrics: Dict[str, Any],
+    cfg: Dict[str, Any],
+    run_report: Dict[str, Any],
+) -> str:
+    candidates = [
+        (metrics.get("eval_protocol", {}) or {}).get("result_partition"),
+        (metrics.get("run_metadata", {}) or {}).get("result_partition"),
+        (run_report.get("eval_protocol", {}) or {}).get("result_partition"),
+        run_report.get("result_partition"),
+        cfg.get("result_partition"),
+    ]
+    for candidate in candidates:
+        normalized = _normalize_partition(candidate)
+        if normalized != "unknown":
+            return normalized
+    return "unknown"
+
+
+def _is_sparql_metrics(metrics: Dict[str, Any]) -> bool:
+    return "execution_accuracy" in metrics and "executable_rate" in metrics
+
+
+def _to_pct(value: Any) -> str:
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except Exception:
+        return "-"
+
+
+def _to_float_str(value: Any, digits: int = 4) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return "-"
+
+
+def summarize(outputs_dir: Path, out_dir: Path) -> None:
     main_rows: List[List[Any]] = []
-    efficiency_rows: List[List[Any]] = []
-    ablation_rows: List[List[Any]] = []
+    external_rows: List[List[Any]] = []
+    per_lang_rows: List[List[Any]] = []
+    clc_rows: List[List[Any]] = []
+    error_rows: List[List[Any]] = []
 
-    for run in runs:
-        cfg = run["cfg"]
-        metrics = run["metrics"]
-        params = run["params"]
-        task = metrics.get("task", cfg.get("task", "unknown"))
-        method = cfg.get("method", "unknown")
+    for metrics_path in _find_metric_files(outputs_dir):
+        metrics = _load_json(metrics_path)
+        if not _is_sparql_metrics(metrics):
+            continue
 
-        if task == "mgsm":
-            overall = metrics.get("overall", {})
-            main_rows.append(
-                [
-                    run["name"],
-                    task,
-                    method,
-                    overall.get("accuracy", 0.0),
-                    "-",
-                    overall.get("num_samples", 0),
-                ]
-            )
+        run_root = _infer_run_root(metrics_path)
+        run_name = run_root.name
+        cfg_path = run_root / "config.yaml"
+        run_report_path = run_root / "run_report.json"
+
+        cfg = _load_yaml(cfg_path) if cfg_path.exists() else {}
+        run_report = _load_json(run_report_path) if run_report_path.exists() else {}
+
+        method = _infer_method(run_name, cfg, run_report)
+        stage = _infer_stage(run_name)
+        result_partition = _infer_result_partition(metrics, cfg, run_report)
+
+        clc = metrics.get("cross_lingual_consistency", {}) or {}
+        eval_protocol = metrics.get("eval_protocol", {}) or {}
+
+        summary_row = [
+            run_name,
+            method,
+            stage,
+            result_partition,
+            _to_pct(metrics.get("execution_accuracy", 0.0)),
+            _to_pct(metrics.get("executable_rate", 0.0)),
+            _to_pct(metrics.get("normalized_em", 0.0)),
+            _to_float_str(metrics.get("answer_f1_macro", 0.0)),
+            _to_float_str(metrics.get("answer_f1_macro_executable_only", 0.0)),
+            _to_pct(clc.get("clc_ans", 0.0)),
+            _to_pct(clc.get("clc_struct", 0.0)),
+            int(metrics.get("total_samples", 0)),
+            str(eval_protocol.get("protocol_id", "")),
+            str(metrics_path.parent),
+        ]
+        if result_partition == "unified_codechain":
+            main_rows.append(summary_row)
         else:
-            overall = metrics.get("overall", {})
-            main_rows.append(
+            external_rows.append(summary_row)
+
+        per_language = metrics.get("per_language", {}) or {}
+        for lang, stats in sorted(per_language.items()):
+            per_lang_rows.append(
                 [
-                    run["name"],
-                    task,
-                    method,
-                    overall.get("chrf", 0.0),
-                    overall.get("bleu", 0.0),
-                    overall.get("num_samples", 0),
+                    run_name,
+                    result_partition,
+                    lang,
+                    _to_pct(stats.get("execution_accuracy", 0.0)),
+                    _to_pct(stats.get("executable_rate", 0.0)),
+                    _to_pct(stats.get("normalized_em", 0.0)),
+                    _to_float_str(stats.get("answer_f1_macro", 0.0)),
+                    int(stats.get("total", 0)),
                 ]
             )
 
-        efficiency_rows.append(
+        clc_rows.append(
             [
-                run["name"],
-                task,
-                method,
-                params.get("lora_params_total", 0),
-                params.get("trainable_params_total", 0),
-                params.get("alrem_target_params", 0),
-                params.get("uniform_matched_params", 0),
-                params.get("relative_error", 0.0),
+                run_name,
+                result_partition,
+                int(clc.get("num_groups", 0)),
+                int(clc.get("incomplete_group_count", 0)),
+                int(clc.get("ans_consistent_groups", 0)),
+                int(clc.get("struct_consistent_groups", 0)),
+                ",".join(clc.get("expected_languages", []) or []),
             ]
         )
 
-        ablation_rows.append(
+        error_rows.append(
             [
-                run["name"],
-                task,
-                method,
-                cfg.get("r_high", "-"),
-                cfg.get("r_low", "-"),
-                cfg.get("r_uniform", "-"),
-                cfg.get("cut_ratio_early", cfg.get("early_end", "-")),
-                cfg.get("cut_ratio_mid", cfg.get("mid_end", "-")),
-                ",".join(cfg.get("target_modules", [])) if cfg.get("target_modules") else "-",
+                run_name,
+                result_partition,
+                ",".join(metrics.get("error_type_schema", []) or []),
+                json.dumps(metrics.get("error_distribution", {}), ensure_ascii=False),
             ]
         )
 
-    write_markdown_table(
-        ["run", "task", "method", "primary", "secondary", "num_samples"],
-        main_rows,
-        os.path.join(args.out_dir, "main_results.md"),
+    main_rows.sort(key=lambda row: row[0])
+    external_rows.sort(key=lambda row: (row[3], row[0]))
+    per_lang_rows.sort(key=lambda row: (row[0], row[1], row[2]))
+    clc_rows.sort(key=lambda row: (row[1], row[0]))
+    error_rows.sort(key=lambda row: (row[1], row[0]))
+
+    headers = [
+        "run",
+        "method",
+        "stage",
+        "result_partition",
+        "EA",
+        "ExecRate",
+        "NormEM",
+        "F1",
+        "F1_exec_only",
+        "CLC_Ans",
+        "CLC_Struct",
+        "samples",
+        "protocol_id",
+        "metrics_dir",
+    ]
+    _write_markdown_table(headers, main_rows, out_dir / "main_results.md")
+    _write_markdown_table(headers, external_rows, out_dir / "external_results.md")
+
+    _write_markdown_table(
+        ["run", "result_partition", "language", "EA", "ExecRate", "NormEM", "F1", "samples"],
+        per_lang_rows,
+        out_dir / "per_language.md",
     )
-    write_markdown_table(
-        [
-            "run",
-            "task",
-            "method",
-            "lora_params_total",
-            "trainable_params_total",
-            "alrem_target_params",
-            "uniform_matched_params",
-            "relative_error",
-        ],
-        efficiency_rows,
-        os.path.join(args.out_dir, "efficiency.md"),
+
+    _write_markdown_table(
+        ["run", "result_partition", "num_groups", "incomplete_groups", "ans_consistent", "struct_consistent", "expected_languages"],
+        clc_rows,
+        out_dir / "clc_groups.md",
     )
-    write_markdown_table(
-        [
-            "run",
-            "task",
-            "method",
-            "r_high",
-            "r_low",
-            "r_uniform",
-            "cut_ratio_early_or_end",
-            "cut_ratio_mid_or_end",
-            "target_modules",
-        ],
-        ablation_rows,
-        os.path.join(args.out_dir, "ablations.md"),
+
+    _write_markdown_table(
+        ["run", "result_partition", "error_type_schema", "error_distribution"],
+        error_rows,
+        out_dir / "error_distribution.md",
     )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Summarize SPARQL evaluation results from outputs directory.")
+    parser.add_argument("--outputs_dir", required=True, type=str)
+    parser.add_argument("--out_dir", required=True, type=str)
+    args = parser.parse_args()
+
+    summarize(Path(args.outputs_dir), Path(args.out_dir))

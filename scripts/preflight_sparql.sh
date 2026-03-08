@@ -13,6 +13,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    echo "[ERROR] python/python3 not found in PATH."
+    exit 1
+  fi
+fi
+
 CONFIG_PATH="${1:-configs/sparql_stage1_alrem.yaml}"
 
 if [ ! -f "${CONFIG_PATH}" ]; then
@@ -23,14 +33,14 @@ fi
 echo "[INFO] Project root: ${PROJECT_ROOT}"
 echo "[INFO] Config: ${CONFIG_PATH}"
 
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 import sys
 if sys.version_info < (3, 10):
     raise SystemExit(f"[ERROR] Python>=3.10 required, got {sys.version}")
 print(f"[OK] Python version: {sys.version.split()[0]}")
 PY
 
-python - <<'PY'
+"${PYTHON_BIN}" - <<'PY'
 modules = [
     "yaml",
     "torch",
@@ -57,7 +67,7 @@ else
   echo "[WARN] nvidia-smi not found. GPU status cannot be validated."
 fi
 
-python - "${CONFIG_PATH}" <<'PY'
+"${PYTHON_BIN}" - "${CONFIG_PATH}" <<'PY'
 import json
 import sys
 from pathlib import Path

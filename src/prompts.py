@@ -1,29 +1,9 @@
-"""Prompt templates and formatting functions for all tasks."""
+"""Prompt templates and formatting functions for SPARQL."""
 
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# MGSM / Flores (existing, unchanged)
-# ---------------------------------------------------------------------------
-MGSM_PROMPT = "Question: {q}\nAnswer:"
-FLORES_PROMPT = "Translate from {src_lang} to {tgt_lang}:\n{source}\nTranslation:"
-
-
-def format_mgsm_prompt(question: str, template: str = MGSM_PROMPT) -> str:
-    return template.format(q=question)
-
-
-def format_flores_prompt(
-    source: str,
-    src_lang: str,
-    tgt_lang: str,
-    template: str = FLORES_PROMPT,
-) -> str:
-    return template.format(src_lang=src_lang, tgt_lang=tgt_lang, source=source)
-
-
-# ---------------------------------------------------------------------------
-# SPARQL (new)
+# SPARQL
 # ---------------------------------------------------------------------------
 SPARQL_SYSTEM_PROMPT = (
     "You are a SPARQL query generator for Wikidata. Given a natural language question, "

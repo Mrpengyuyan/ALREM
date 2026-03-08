@@ -4,7 +4,7 @@ import logging
 import random
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.error import URLError
 from urllib.request import urlopen
 
@@ -692,8 +692,12 @@ def download_qald9plus(data_dir: str) -> str:
     )
 
 
-def _normalize_qald_samples(bundle_entries: List[Dict[str, Any]], languages: Optional[List[str]]) -> List[Dict[str, str]]:
-    lang_set = set(_safe_lang(lang) for lang in languages) if languages else None
+def _normalize_qald_samples(
+    bundle_entries: List[Dict[str, Any]],
+    languages: Optional[List[str]],
+    strict_languages: bool = False,
+) -> List[Dict[str, str]]:
+    lang_set: Optional[Set[str]] = set(_safe_lang(lang) for lang in languages) if languages else None
     normalized: List[Dict[str, str]] = []
 
     for entry in bundle_entries:
@@ -713,15 +717,24 @@ def _normalize_qald_samples(bundle_entries: List[Dict[str, Any]], languages: Opt
             qid = _resolve_qid(raw_record, sparql=sparql, lang_questions=lang_map)
 
             if lang_set is not None:
-                for lang in sorted(lang_set):
-                    question = lang_map.get(lang)
-                    if not question:
+                missing_languages = [lang for lang in sorted(lang_set) if not lang_map.get(lang)]
+                if missing_languages:
+                    missing_csv = ",".join(missing_languages)
+                    if strict_languages:
+                        raise ValueError(
+                            "QALD language set is incomplete for strict mode. "
+                            f"qid={qid} missing_languages={missing_csv} source={file_name}"
+                        )
+                    for lang in missing_languages:
                         LOGGER.warning(
                             "QALD qid=%s missing language='%s' in %s, skipped.",
                             qid,
                             lang,
                             file_name,
                         )
+                for lang in sorted(lang_set):
+                    question = lang_map.get(lang)
+                    if not question:
                         continue
                     normalized.append(
                         {
@@ -786,12 +799,20 @@ def load_qald9plus_train(data_dir: str, languages: Optional[List[str]] = None) -
     return data
 
 
-def load_qald9plus_test(data_dir: str, languages: Optional[List[str]] = None) -> List[Dict[str, str]]:
+def load_qald9plus_test(
+    data_dir: str,
+    languages: Optional[List[str]] = None,
+    strict_languages: bool = False,
+) -> List[Dict[str, str]]:
     requested_languages = languages or DEFAULT_QALD_TEST_LANGUAGES
     bundle = _load_qald_bundle_with_fallback(data_dir)
     entries = _select_qald_split_entries(bundle, "test")
 
-    data = _normalize_qald_samples(entries, languages=requested_languages)
+    data = _normalize_qald_samples(
+        entries,
+        languages=requested_languages,
+        strict_languages=strict_languages,
+    )
     if not data:
         raise ValueError("QALD test split loaded but no valid samples after normalization.")
     LOGGER.info("Loaded QALD test samples: %d", len(data))

@@ -16,6 +16,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+PYTHON_BIN="${PYTHON_BIN:-python}"
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="python3"
+    else
+        echo "[ERROR] python/python3 not found in PATH."
+        exit 1
+    fi
+fi
+
 CONFIG="${CONFIG:-configs/sparql_stage1_alrem.yaml}"
 
 echo "=========================================="
@@ -23,7 +33,7 @@ echo " Stage 1 Training"
 echo " Config: ${CONFIG}"
 echo "=========================================="
 
-CMD=(python -m src.train_sft --config "${CONFIG}")
+CMD=("${PYTHON_BIN}" -m src.train_sft --config "${CONFIG}")
 
 # Optional CLI overrides
 if [ -n "${OUTPUT_DIR:-}" ]; then

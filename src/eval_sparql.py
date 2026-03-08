@@ -11,6 +11,7 @@ executes them via SPARQLCache, and computes:
 """
 
 import argparse
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -23,10 +24,37 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import torch
 
 from .prompts import build_sparql_infer_text
+from .run_identity import (
+    build_run_id,
+    validate_protocol_id,
+    validate_result_partition,
+    validate_run_id,
+)
 from .sparql_executor import SPARQLCache
 from .utils import ensure_dir, load_yaml, save_json, set_seed, setup_logging
 
 LOGGER = logging.getLogger("alrem.eval_sparql")
+
+DEFAULT_EVAL_PROTOCOL_PATH = str(
+    Path(__file__).resolve().parents[1] / "configs" / "sparql_eval_shared.yaml"
+)
+ALLOWED_ERROR_TYPES = {
+    "generation_empty",
+    "syntax_or_parse_error",
+    "execution_error",
+    "wrong_answer",
+}
+ALLOWED_PRED_MODES = {"adapter", "icl_zero", "icl_fewshot"}
+SUPPORTED_PRIMARY_METRICS = {"EA", "ER", "CLC-Ans", "CLC-Struct"}
+SUPPORTED_AUX_METRICS = {"NormEM", "AnswerF1"}
+PARSE_ERROR_HINTS = (
+    "parse",
+    "syntax",
+    "malformed",
+    "lexical",
+    "bad query",
+    "unexpected token",
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -45,6 +73,95 @@ def _load_jsonl(path: str) -> List[Dict[str, Any]]:
             except json.JSONDecodeError as exc:
                 LOGGER.warning("Skip invalid JSON at %s:%d (%s)", path, line_no, exc)
     return records
+
+
+def _load_json(path: str) -> Dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        obj = json.load(handle)
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected JSON object in {path}, got {type(obj).__name__}.")
+    return obj
+
+
+def _compute_protocol_id(protocol_cfg: Dict[str, Any]) -> str:
+    protocol_id = str(protocol_cfg.get("protocol_id", "")).strip()
+    protocol_name = str(protocol_cfg.get("protocol_name", "")).strip()
+    protocol_version = str(protocol_cfg.get("protocol_version", "")).strip()
+    derived = ""
+    if protocol_name and protocol_version:
+        derived = f"{protocol_name}:{protocol_version}"
+    elif protocol_name:
+        derived = protocol_name
+    elif protocol_cfg:
+        derived = "eval_protocol"
+
+    if protocol_id and derived and protocol_id != derived:
+        raise ValueError(
+            "Eval protocol_id mismatch with protocol_name/protocol_version: "
+            f"protocol_id={protocol_id} derived={derived}"
+        )
+    resolved = protocol_id or derived
+    if not resolved:
+        return ""
+    return validate_protocol_id(resolved)
+
+
+def _resolve_allowed_error_types(protocol_cfg: Dict[str, Any], strict_schema: bool) -> Set[str]:
+    configured = protocol_cfg.get("allowed_error_types")
+    if configured is None:
+        return set(ALLOWED_ERROR_TYPES)
+    parsed = {str(item).strip() for item in configured if str(item).strip()}
+    if strict_schema and parsed != ALLOWED_ERROR_TYPES:
+        raise ValueError(
+            "allowed_error_types in eval protocol must exactly match fixed schema. "
+            f"expected={sorted(ALLOWED_ERROR_TYPES)} configured={sorted(parsed)}"
+        )
+    if not parsed:
+        return set(ALLOWED_ERROR_TYPES)
+    unknown = parsed - ALLOWED_ERROR_TYPES
+    if unknown:
+        msg = f"Unsupported allowed_error_types in protocol: {sorted(unknown)}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning("%s; fallback to fixed schema.", msg)
+        return set(ALLOWED_ERROR_TYPES)
+    return parsed
+
+
+def _resolve_metric_names(
+    protocol_cfg: Dict[str, Any],
+    *,
+    strict_schema: bool,
+) -> Tuple[List[str], List[str]]:
+    configured_primary = protocol_cfg.get("primary_metrics") or sorted(SUPPORTED_PRIMARY_METRICS)
+    configured_aux = protocol_cfg.get("aux_metrics") or sorted(SUPPORTED_AUX_METRICS)
+
+    primary = [str(item).strip() for item in configured_primary if str(item).strip()]
+    aux = [str(item).strip() for item in configured_aux if str(item).strip()]
+
+    bad_primary = sorted(set(primary) - SUPPORTED_PRIMARY_METRICS)
+    bad_aux = sorted(set(aux) - SUPPORTED_AUX_METRICS)
+    if bad_primary or bad_aux:
+        msg = (
+            "Unsupported metric names in eval protocol: "
+            f"primary={bad_primary} aux={bad_aux}"
+        )
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning("%s; fallback to supported defaults.", msg)
+        return sorted(SUPPORTED_PRIMARY_METRICS), sorted(SUPPORTED_AUX_METRICS)
+    return primary, aux
+
+
+def _cleanup_internal_prediction_fields(records: List[Dict[str, Any]]) -> None:
+    for record in records:
+        internal_keys = [key for key in record.keys() if key.startswith("__")]
+        for key in internal_keys:
+            record.pop(key, None)
+
+
+def _find_default_run_metadata_path(predictions_file: str) -> str:
+    return str(Path(predictions_file).resolve().parent / "run_metadata.json")
 
 
 def _normalize_sparql(sparql: str) -> str:
@@ -79,6 +196,55 @@ def _parse_language_list(csv_text: Optional[str]) -> Optional[List[str]]:
     tokens = [token.strip().lower() for token in csv_text.split(",")]
     langs = [token for token in tokens if token]
     return langs if langs else None
+
+
+def _normalize_language_list(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return _parse_language_list(value)
+    if isinstance(value, list):
+        langs = [str(token).strip().lower() for token in value if str(token).strip()]
+        return langs if langs else None
+    return None
+
+
+def _resolve_bool(cli_flag: bool, cfg_value: Any, protocol_value: Any, default: bool = False) -> bool:
+    if cli_flag:
+        return True
+    if cfg_value is not None:
+        return bool(cfg_value)
+    if protocol_value is not None:
+        return bool(protocol_value)
+    return default
+
+
+def _is_syntax_or_parse_error(message: str, error_type: str = "") -> bool:
+    text = f"{error_type} {message}".strip().lower()
+    return any(hint in text for hint in PARSE_ERROR_HINTS)
+
+
+def _build_error_detail(
+    *,
+    stage: str,
+    code: str,
+    message: str = "",
+    raw_error_type: str = "",
+    raw_exception: str = "",
+    cache_related: bool = False,
+    pred_executable: bool = False,
+    gold_executable: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "stage": stage,
+        "code": code,
+        "message": message,
+        "raw_error_type": raw_error_type,
+        "raw_exception": raw_exception,
+        "cache_related": bool(cache_related),
+        "pred_executable": bool(pred_executable),
+        "gold_executable": bool(gold_executable),
+    }
 
 
 def _filter_by_languages(
@@ -122,6 +288,10 @@ def _normalize_prediction_record(record: Dict[str, Any], idx: int) -> Optional[D
     except (TypeError, ValueError):
         norm_idx = idx
 
+    raw_mode = _to_str_or_empty(record.get("mode"))
+    raw_run_id = _to_str_or_empty(record.get("run_id"))
+    raw_protocol_id = _to_str_or_empty(record.get("protocol_id"))
+
     normalized: Dict[str, Any] = {
         "idx": norm_idx,
         "qid": _to_str_or_empty(record.get("qid")) or _to_str_or_empty(record.get("id")),
@@ -130,9 +300,13 @@ def _normalize_prediction_record(record: Dict[str, Any], idx: int) -> Optional[D
         "gold_sparql": gold_sparql,
         "pred_sparql": pred_sparql,
         "generation_time_sec": round(generation_time, 3),
+        "mode": raw_mode or "adapter",
+        "run_id": raw_run_id,
+        "protocol_id": raw_protocol_id,
+        "__missing_mode": not bool(raw_mode),
+        "__missing_run_id": not bool(raw_run_id),
+        "__missing_protocol_id": not bool(raw_protocol_id),
     }
-    if "mode" in record:
-        normalized["mode"] = str(record.get("mode", "")).strip()
     return normalized
 
 
@@ -152,7 +326,279 @@ def _load_predictions_jsonl(path: str) -> List[Dict[str, Any]]:
     return normalized
 
 
+def _validate_predictions_schema(
+    records: List[Dict[str, Any]],
+    *,
+    strict_schema: bool,
+    expected_protocol_id: str,
+    expected_run_id: str,
+    allowed_modes: Set[str],
+) -> None:
+    if not records:
+        raise ValueError("No prediction records available for schema validation.")
+
+    invalid_modes = []
+    missing_mode = 0
+    missing_run_id = 0
+    missing_protocol = 0
+    mismatch_protocol = 0
+    mismatch_run_id = 0
+    invalid_run_ids: List[Tuple[int, str]] = []
+    for idx, record in enumerate(records):
+        mode_raw = str(record.get("mode", "")).strip().lower()
+        run_id_raw = str(record.get("run_id", "")).strip()
+        if bool(record.get("__missing_mode", "mode" not in record)) or not mode_raw:
+            missing_mode += 1
+        if bool(record.get("__missing_run_id", "run_id" not in record)) or not run_id_raw:
+            missing_run_id += 1
+        elif run_id_raw:
+            try:
+                validate_run_id(run_id_raw)
+            except ValueError:
+                invalid_run_ids.append((idx, run_id_raw))
+        if expected_run_id and run_id_raw and run_id_raw != expected_run_id:
+            mismatch_run_id += 1
+        if mode_raw and mode_raw not in allowed_modes:
+            invalid_modes.append((idx, mode_raw))
+        protocol_id = str(record.get("protocol_id", "")).strip()
+        if expected_protocol_id:
+            if not protocol_id:
+                missing_protocol += 1
+            elif protocol_id != expected_protocol_id:
+                mismatch_protocol += 1
+
+    if invalid_modes:
+        sample = ", ".join(f"{i}:{m}" for i, m in invalid_modes[:5])
+        msg = f"Found unsupported prediction modes: {sample}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if missing_mode:
+        msg = f"Prediction records missing mode: {missing_mode}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if missing_run_id:
+        msg = f"Prediction records missing run_id: {missing_run_id}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if invalid_run_ids:
+        sample = ", ".join(f"{i}:{v}" for i, v in invalid_run_ids[:5])
+        msg = f"Prediction records have invalid run_id format: {sample}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if expected_run_id and mismatch_run_id:
+        msg = f"Prediction run_id mismatch: mismatch_count={mismatch_run_id} expected={expected_run_id}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    if expected_protocol_id and (missing_protocol or mismatch_protocol):
+        msg = (
+            "Prediction protocol_id mismatch: "
+            f"missing={missing_protocol} mismatch={mismatch_protocol} expected={expected_protocol_id}"
+        )
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+
 # ── Model loading ────────────────────────────────────────────────────────────
+
+def _validate_run_metadata_schema(
+    metadata: Dict[str, Any],
+    *,
+    strict_schema: bool,
+    enforce_protocol: bool,
+    expected_protocol_id: str,
+    expected_result_partition: str,
+    allowed_modes: Set[str],
+    protocol_cfg: Dict[str, Any],
+    predictions: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    required_fields = {
+        "run_id",
+        "run_name",
+        "mode",
+        "method",
+        "model_name_or_path",
+        "adapter_path",
+        "test_data_path",
+        "test_languages",
+        "max_seq_len",
+        "max_new_tokens",
+        "do_sample",
+        "temperature",
+        "top_p",
+        "cache_dir",
+        "offline_only",
+        "result_partition",
+        "protocol_name",
+        "protocol_version",
+        "protocol_id",
+        "seed",
+    }
+    missing_required = sorted(k for k in required_fields if k not in metadata)
+    if missing_required:
+        msg = f"run_metadata missing required fields: {missing_required}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    mode = str(metadata.get("mode", "")).strip().lower()
+    if mode and mode not in allowed_modes:
+        msg = f"run_metadata mode is unsupported: {mode}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    metadata_protocol_id = str(metadata.get("protocol_id", "")).strip()
+    if metadata_protocol_id:
+        try:
+            validate_protocol_id(metadata_protocol_id)
+        except ValueError as exc:
+            if strict_schema:
+                raise
+            LOGGER.warning("%s", exc)
+
+    if expected_protocol_id and metadata_protocol_id != expected_protocol_id:
+        msg = (
+            "run_metadata protocol_id mismatch: "
+            f"expected={expected_protocol_id} actual={metadata_protocol_id or '<missing>'}"
+        )
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    metadata_result_partition = ""
+    try:
+        metadata_result_partition = validate_result_partition(
+            metadata.get("result_partition"),
+            strict_schema=strict_schema,
+        )
+    except ValueError as exc:
+        if strict_schema:
+            raise
+        LOGGER.warning("%s", exc)
+    if expected_result_partition and metadata_result_partition and metadata_result_partition != expected_result_partition:
+        msg = (
+            "run_metadata result_partition mismatch with eval protocol: "
+            f"expected={expected_result_partition} metadata={metadata_result_partition}"
+        )
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+
+    metadata_run_id = str(metadata.get("run_id", "")).strip()
+    if metadata_run_id:
+        try:
+            validate_run_id(metadata_run_id)
+        except ValueError as exc:
+            if strict_schema:
+                raise
+            LOGGER.warning("%s", exc)
+    try:
+        metadata_seed = int(metadata.get("seed"))
+    except (TypeError, ValueError):
+        metadata_seed = None
+        msg = f"run_metadata seed is not a valid int: {metadata.get('seed')}"
+        if strict_schema:
+            raise ValueError(msg)
+        LOGGER.warning(msg)
+    metadata_run_name = str(metadata.get("run_name", "")).strip()
+    expected_run_id_from_metadata = ""
+    if metadata_run_name and mode and metadata_protocol_id and metadata_seed is not None:
+        expected_run_id_from_metadata = build_run_id(
+            run_name=metadata_run_name,
+            mode=mode,
+            protocol_id=metadata_protocol_id,
+            seed=metadata_seed,
+        )
+        if metadata_run_id and metadata_run_id != expected_run_id_from_metadata:
+            msg = (
+                "run_metadata run_id does not follow naming rule: "
+                f"expected={expected_run_id_from_metadata} actual={metadata_run_id}"
+            )
+            if strict_schema:
+                raise ValueError(msg)
+            LOGGER.warning(msg)
+
+    if predictions:
+        run_ids = {str(rec.get("run_id", "")).strip() for rec in predictions if str(rec.get("run_id", "")).strip()}
+        modes = {str(rec.get("mode", "")).strip().lower() for rec in predictions if str(rec.get("mode", "")).strip()}
+        protocol_ids = {
+            str(rec.get("protocol_id", "")).strip()
+            for rec in predictions
+            if str(rec.get("protocol_id", "")).strip()
+        }
+
+        if run_ids and metadata_run_id and metadata_run_id not in run_ids:
+            msg = (
+                "run_metadata run_id mismatch with predictions: "
+                f"metadata={metadata_run_id} predictions={sorted(run_ids)}"
+            )
+            if strict_schema:
+                raise ValueError(msg)
+            LOGGER.warning(msg)
+
+        if modes and mode and mode not in modes:
+            msg = f"run_metadata mode mismatch with predictions: metadata={mode} predictions={sorted(modes)}"
+            if strict_schema:
+                raise ValueError(msg)
+            LOGGER.warning(msg)
+
+        if expected_protocol_id and protocol_ids and expected_protocol_id not in protocol_ids:
+            msg = (
+                "Predictions protocol_id mismatch with eval protocol: "
+                f"expected={expected_protocol_id} predictions={sorted(protocol_ids)}"
+            )
+            if strict_schema:
+                raise ValueError(msg)
+            LOGGER.warning(msg)
+
+    if enforce_protocol:
+        protocol_languages = _normalize_language_list(protocol_cfg.get("test_languages"))
+        metadata_languages = _normalize_language_list(metadata.get("test_languages"))
+        if protocol_languages is not None:
+            if metadata_languages is None or set(metadata_languages) != set(protocol_languages):
+                msg = (
+                    "run_metadata test_languages mismatch with eval protocol. "
+                    f"protocol={sorted(protocol_languages)} metadata={sorted(metadata_languages or [])}"
+                )
+                if strict_schema:
+                    raise ValueError(msg)
+                LOGGER.warning(msg)
+
+        for key in (
+            "max_seq_len",
+            "max_new_tokens",
+            "do_sample",
+            "temperature",
+            "top_p",
+            "cache_dir",
+            "offline_only",
+            "test_data_path",
+            "result_partition",
+        ):
+            if key not in protocol_cfg:
+                continue
+            protocol_value = protocol_cfg.get(key)
+            metadata_value = metadata.get(key)
+            if protocol_value != metadata_value:
+                msg = (
+                    f"run_metadata {key} mismatch with eval protocol: "
+                    f"protocol={protocol_value} metadata={metadata_value}"
+                )
+                if strict_schema:
+                    raise ValueError(msg)
+                LOGGER.warning(msg)
+
 
 def load_model_for_eval(
     model_name: str,
@@ -283,6 +729,8 @@ def batch_generate(
     temperature: float = 1.0,
     top_p: float = 1.0,
     few_shot_examples: Optional[List[Dict[str, str]]] = None,
+    run_id: str = "",
+    protocol_id: str = "",
 ) -> List[Dict[str, Any]]:
     """Generate SPARQL for all test samples."""
     results: List[Dict[str, Any]] = []
@@ -318,6 +766,9 @@ def batch_generate(
             "gold_sparql": gold_sparql,
             "pred_sparql": pred_sparql,
             "generation_time_sec": round(elapsed, 3),
+            "mode": "adapter",
+            "run_id": run_id,
+            "protocol_id": protocol_id,
         })
 
         if (idx + 1) % 10 == 0 or idx + 1 == total:
@@ -344,11 +795,19 @@ def _execute_and_compare(
         "answer_f1_eligible": False,
         "pred_answers": [],
         "gold_answers": [],
-        "error_type": "generation_empty",
+        "error_type": "",
+        "error_detail": {},
     }
 
     if not pred_sparql.strip():
         result["error_type"] = "generation_empty"
+        result["error_detail"] = _build_error_detail(
+            stage="generation",
+            code="empty_prediction",
+            message="Model output is empty.",
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
         return result
 
     # Normalized EM
@@ -362,12 +821,32 @@ def _execute_and_compare(
         if gold_result.get("ok", False):
             result["gold_executable"] = True
             result["gold_answers"] = gold_result.get("normalized_answers", [])
+        else:
+            result["error_type"] = "execution_error"
+            result["error_detail"] = _build_error_detail(
+                stage="gold_execute",
+                code="gold_query_failed",
+                message=str(gold_result.get("error", "")),
+                raw_error_type=str(gold_result.get("error_type", "")),
+                pred_executable=result["pred_executable"],
+                gold_executable=result["gold_executable"],
+            )
     except FileNotFoundError:
         if offline_only:
             raise
         LOGGER.debug("Gold SPARQL cache miss (offline): %s...", gold_sparql[:80])
     except Exception as exc:
         LOGGER.debug("Gold SPARQL execution error: %s", exc)
+        result["error_type"] = "execution_error"
+        result["error_detail"] = _build_error_detail(
+            stage="gold_execute",
+            code="gold_execute_exception",
+            message=str(exc),
+            raw_error_type=type(exc).__name__,
+            raw_exception=repr(exc),
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
 
     # Execute pred
     try:
@@ -375,16 +854,52 @@ def _execute_and_compare(
         if pred_result.get("ok", False):
             result["pred_executable"] = True
             result["pred_answers"] = pred_result.get("normalized_answers", [])
-            result["error_type"] = ""  # No error if executable
         else:
-            result["error_type"] = "execution_error"
+            raw_message = str(pred_result.get("error", "")).strip()
+            raw_error_type = str(pred_result.get("error_type", "")).strip()
+            classified = (
+                "syntax_or_parse_error"
+                if _is_syntax_or_parse_error(raw_message, raw_error_type)
+                else "execution_error"
+            )
+            result["error_type"] = classified
+            result["error_detail"] = _build_error_detail(
+                stage="pred_execute",
+                code="pred_query_failed",
+                message=raw_message,
+                raw_error_type=raw_error_type,
+                pred_executable=result["pred_executable"],
+                gold_executable=result["gold_executable"],
+            )
     except FileNotFoundError:
         if offline_only:
             raise
-        result["error_type"] = "cache_miss"
+        result["error_type"] = "execution_error"
+        result["error_detail"] = _build_error_detail(
+            stage="pred_execute",
+            code="cache_miss",
+            message="Cache miss while offline_only=False fallback path.",
+            cache_related=True,
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
         LOGGER.debug("Pred SPARQL cache miss (offline): %s...", pred_sparql[:80])
     except Exception as exc:
-        result["error_type"] = "execution_exception"
+        classified = (
+            "syntax_or_parse_error"
+            if _is_syntax_or_parse_error(str(exc), type(exc).__name__)
+            else "execution_error"
+        )
+        result["error_type"] = classified
+        result["error_detail"] = _build_error_detail(
+            stage="pred_execute",
+            code="pred_execute_exception",
+            message=str(exc),
+            raw_error_type=type(exc).__name__,
+            raw_exception=repr(exc),
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
         LOGGER.debug("Pred SPARQL execution error: %s", exc)
 
     # Execution Accuracy: both executable and same answer set
@@ -400,13 +915,28 @@ def _execute_and_compare(
 
     # Classify error type for non-matching results
     if not result["execution_match"] and result["pred_executable"]:
-        if not result["pred_answers"]:
-            result["error_type"] = "empty_result"
-        else:
-            result["error_type"] = "wrong_answer"
+        result["error_type"] = "wrong_answer"
+        detail_code = "empty_answer_set" if not result["pred_answers"] else "answer_mismatch"
+        result["error_detail"] = _build_error_detail(
+            stage="compare",
+            code=detail_code,
+            message="Predicted executable query does not match gold answers.",
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
 
-    if not result["pred_executable"] and not result["error_type"]:
-        result["error_type"] = "not_executable"
+    if result["execution_match"]:
+        result["error_type"] = ""
+        result["error_detail"] = {}
+    elif not result["pred_executable"] and not result["error_type"]:
+        result["error_type"] = "execution_error"
+        result["error_detail"] = _build_error_detail(
+            stage="pred_execute",
+            code="pred_not_executable",
+            message="Predicted query is not executable.",
+            pred_executable=result["pred_executable"],
+            gold_executable=result["gold_executable"],
+        )
 
     return result
 
@@ -436,6 +966,7 @@ def compute_answer_f1(
 
 def compute_clc(
     results: List[Dict[str, Any]],
+    expected_languages: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Compute Cross-Lingual Consistency by grouping on canonical qid.
 
@@ -450,16 +981,50 @@ def compute_clc(
         if qid:
             groups[qid].append(r)
 
+    required_langs: Optional[Set[str]] = None
+    if expected_languages:
+        required_langs = {
+            str(lang).strip().lower()
+            for lang in expected_languages
+            if str(lang).strip()
+        }
+
     if not groups:
-        return {"clc_ans": 0.0, "clc_struct": 0.0, "num_groups": 0}
+        return {
+            "clc_ans": 0.0,
+            "clc_struct": 0.0,
+            "num_groups": 0,
+            "ans_consistent_groups": 0,
+            "struct_consistent_groups": 0,
+            "expected_languages": sorted(required_langs) if required_langs else [],
+            "incomplete_group_count": 0,
+            "incomplete_groups": [],
+        }
 
     ans_consistent = 0
     struct_consistent = 0
     total_groups = 0
+    incomplete_groups: List[Dict[str, Any]] = []
 
     for qid, items in groups.items():
-        if len(items) < 2:
-            # Need at least 2 languages to measure consistency
+        present_langs = {
+            str(item.get("language", "")).strip().lower()
+            for item in items
+            if str(item.get("language", "")).strip()
+        }
+        if required_langs is not None:
+            missing = sorted(required_langs - present_langs)
+            if missing:
+                incomplete_groups.append(
+                    {
+                        "qid": qid,
+                        "present_languages": sorted(present_langs),
+                        "missing_languages": missing,
+                    }
+                )
+                continue
+        elif len(items) < 2:
+            # Need at least 2 languages to measure consistency when no language set is specified.
             continue
         total_groups += 1
 
@@ -489,6 +1054,9 @@ def compute_clc(
         "num_groups": total_groups,
         "ans_consistent_groups": ans_consistent,
         "struct_consistent_groups": struct_consistent,
+        "expected_languages": sorted(required_langs) if required_langs else [],
+        "incomplete_group_count": len(incomplete_groups),
+        "incomplete_groups": incomplete_groups,
     }
 
 
@@ -496,6 +1064,9 @@ def compute_all_metrics(
     results: List[Dict[str, Any]],
     cache: SPARQLCache,
     offline_only: bool = True,
+    expected_languages: Optional[List[str]] = None,
+    allowed_error_types: Optional[Set[str]] = None,
+    fail_on_cache_miss: bool = True,
 ) -> Dict[str, Any]:
     """Compute all 6 metric categories over evaluation results."""
     total = len(results)
@@ -515,8 +1086,19 @@ def compute_all_metrics(
             "f1_executable_samples": 0,
             "per_language": {},
             "error_distribution": {},
-            "cross_lingual_consistency": {"clc_ans": 0.0, "clc_struct": 0.0, "num_groups": 0},
+            "cross_lingual_consistency": {
+                "clc_ans": 0.0,
+                "clc_struct": 0.0,
+                "num_groups": 0,
+                "ans_consistent_groups": 0,
+                "struct_consistent_groups": 0,
+                "expected_languages": [],
+                "incomplete_group_count": 0,
+                "incomplete_groups": [],
+            },
         }
+
+    effective_allowed_error_types = set(allowed_error_types or ALLOWED_ERROR_TYPES)
 
     # Execute and compare each result
     ea_count = 0
@@ -538,12 +1120,33 @@ def compute_all_metrics(
                 r["pred_sparql"], r["gold_sparql"], cache, offline_only
             )
         except FileNotFoundError as exc:
-            qid = str(r.get("qid", "")).strip() or "<no-qid>"
-            lang = str(r.get("language", "")).strip() or "unk"
-            raise RuntimeError(
-                "Offline evaluation cache miss detected. "
-                f"qid={qid}, language={lang}. {exc}"
-            ) from exc
+            if fail_on_cache_miss:
+                qid = str(r.get("qid", "")).strip() or "<no-qid>"
+                lang = str(r.get("language", "")).strip() or "unk"
+                raise RuntimeError(
+                    "Offline evaluation cache miss detected. "
+                    f"qid={qid}, language={lang}. {exc}"
+                ) from exc
+            exec_info = {
+                "pred_executable": False,
+                "gold_executable": False,
+                "execution_match": False,
+                "normalized_em": False,
+                "semantic_equivalent": False,
+                "answer_f1_eligible": False,
+                "pred_answers": [],
+                "gold_answers": [],
+                "error_type": "execution_error",
+                "error_detail": _build_error_detail(
+                    stage="execute",
+                    code="cache_miss",
+                    message=str(exc),
+                    cache_related=True,
+                    raw_exception=repr(exc),
+                    pred_executable=False,
+                    gold_executable=False,
+                ),
+            }
         r["exec_info"] = exec_info  # attach for CLC
 
         lang = r.get("language", "unk")
@@ -578,7 +1181,10 @@ def compute_all_metrics(
         per_language[lang]["f1_sum"] += f1_info["f1"]
 
         if exec_info.get("error_type"):
-            error_types[exec_info["error_type"]] += 1
+            error_type = str(exec_info["error_type"]).strip()
+            if error_type not in effective_allowed_error_types:
+                error_type = "execution_error"
+            error_types[error_type] += 1
 
     # Aggregate
     metrics: Dict[str, Any] = {
@@ -610,12 +1216,32 @@ def compute_all_metrics(
 
     # Error classification
     metrics["error_distribution"] = dict(sorted(error_types.items(), key=lambda kv: -kv[1]))
+    metrics["error_type_schema"] = sorted(effective_allowed_error_types)
 
     # Cross-lingual consistency
-    clc = compute_clc(results)
+    clc = compute_clc(results, expected_languages=expected_languages)
     metrics["cross_lingual_consistency"] = clc
 
     return metrics
+
+
+def _validate_decoding_args(
+    *,
+    max_seq_len: int,
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+) -> None:
+    if max_seq_len <= 0:
+        raise ValueError(f"max_seq_len must be > 0, got {max_seq_len}")
+    if max_new_tokens <= 0:
+        raise ValueError(f"max_new_tokens must be > 0, got {max_new_tokens}")
+    if do_sample:
+        if temperature <= 0:
+            raise ValueError(f"temperature must be > 0 when do_sample=True, got {temperature}")
+        if not (0.0 < top_p <= 1.0):
+            raise ValueError(f"top_p must be in (0, 1] when do_sample=True, got {top_p}")
 
 
 # ── Main CLI ─────────────────────────────────────────────────────────────────
@@ -624,8 +1250,12 @@ def parse_eval_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate SPARQL generation.")
     parser.add_argument("--config", type=str, default=None,
                         help="Training config YAML (reads model/data paths from it).")
+    parser.add_argument("--eval_protocol", type=str, default=None,
+                        help="Shared evaluation protocol YAML path.")
     parser.add_argument("--predictions_file", type=str, default=None,
                         help="Path to an existing predictions JSONL to evaluate only.")
+    parser.add_argument("--run_metadata_file", type=str, default=None,
+                        help="Path to run_metadata.json (required for strict protocol validation).")
     parser.add_argument("--adapter_path", type=str, default=None,
                         help="Path to trained adapter (overrides config).")
     parser.add_argument("--model_name", type=str, default=None,
@@ -668,37 +1298,151 @@ def main() -> None:
     # Load config if provided
     cfg: Dict[str, Any] = {}
     if args.config:
-        cfg = load_yaml(args.config)
+        cfg = load_yaml(args.config) or {}
+
+    eval_protocol_arg = getattr(args, "eval_protocol", None)
+    eval_protocol_path = eval_protocol_arg or cfg.get("eval_protocol_path") or DEFAULT_EVAL_PROTOCOL_PATH
+    if not eval_protocol_path:
+        raise ValueError("Eval protocol path is required.")
+    protocol_file = Path(eval_protocol_path)
+    if not protocol_file.exists():
+        raise FileNotFoundError(f"Eval protocol file not found: {eval_protocol_path}")
+
+    protocol_cfg: Dict[str, Any] = load_yaml(str(protocol_file)) or {}
+    eval_protocol_loaded_path = str(protocol_file)
+    strict_schema = bool(protocol_cfg.get("strict_schema", True))
+    protocol_name = str(protocol_cfg.get("protocol_name", "")).strip()
+    protocol_version = str(protocol_cfg.get("protocol_version", "")).strip()
+    protocol_id = _compute_protocol_id(protocol_cfg)
+    if strict_schema and "protocol_id" not in protocol_cfg:
+        raise ValueError("strict_schema=True requires protocol_id in eval protocol config.")
+    main_table_protocol = bool(protocol_cfg.get("main_table_protocol", False))
+    if main_table_protocol and not strict_schema:
+        raise ValueError("main_table_protocol=true requires strict_schema=true.")
+    protocol_result_partition = validate_result_partition(
+        protocol_cfg.get("result_partition"),
+        strict_schema=strict_schema,
+    )
+
+    enforce_protocol = bool(protocol_cfg.get("enforce_protocol", True))
+    protocol_languages = _normalize_language_list(protocol_cfg.get("test_languages"))
+    protocol_allowed_modes = {
+        str(mode).strip().lower()
+        for mode in protocol_cfg.get("allowed_modes", sorted(ALLOWED_PRED_MODES))
+        if str(mode).strip()
+    } or set(ALLOWED_PRED_MODES)
+    allowed_error_types = _resolve_allowed_error_types(protocol_cfg, strict_schema=strict_schema)
+    primary_metric_names, aux_metric_names = _resolve_metric_names(
+        protocol_cfg,
+        strict_schema=strict_schema,
+    )
+    fail_on_cache_miss = bool(protocol_cfg.get("fail_on_cache_miss", True))
 
     # Resolve parameters (CLI overrides config)
     predictions_file = args.predictions_file or cfg.get("predictions_file")
-    model_name = args.model_name or cfg.get("model_name_or_path")
+    run_metadata_file = args.run_metadata_file or cfg.get("run_metadata_file")
+    model_name = args.model_name or cfg.get("model_name_or_path") or protocol_cfg.get("model_name_or_path")
     adapter_path = args.adapter_path or cfg.get("adapter_path")
     if not adapter_path:
         adapter_path = os.path.join(
             cfg.get("output_dir", "outputs"),
             cfg.get("run_name", "run"),
         )
-    test_data_path = args.test_data or cfg.get("test_data_path")
-    cache_dir = args.cache_dir or cfg.get("sparql_cache_dir", "data/sparql/cache")
+    test_data_path = args.test_data or cfg.get("test_data_path") or protocol_cfg.get("test_data_path")
+    cache_dir = (
+        args.cache_dir
+        or cfg.get("sparql_cache_dir")
+        or protocol_cfg.get("cache_dir")
+        or "data/sparql/cache"
+    )
     if args.output_dir:
         output_dir = args.output_dir
     elif predictions_file:
         output_dir = str(Path(predictions_file).resolve().parent / "eval_results")
     else:
         output_dir = os.path.join(adapter_path, "eval_results")
-    offline_only = args.offline_only or cfg.get("offline_only", False)
-    quantization = args.quantization or cfg.get("quantization", "4bit")
-    max_seq_len = int(args.max_seq_len if args.max_seq_len is not None else cfg.get("max_seq_len", 512))
-    max_new_tokens = int(args.max_new_tokens if args.max_new_tokens is not None else cfg.get("max_new_tokens", 256))
-    do_sample = bool(args.do_sample or cfg.get("do_sample", False))
-    temperature = float(args.temperature if args.temperature is not None else cfg.get("temperature", 1.0))
-    top_p = float(args.top_p if args.top_p is not None else cfg.get("top_p", 1.0))
+    offline_only = _resolve_bool(
+        cli_flag=args.offline_only,
+        cfg_value=cfg.get("offline_only"),
+        protocol_value=protocol_cfg.get("offline_only"),
+        default=False,
+    )
+    quantization = args.quantization or cfg.get("quantization", protocol_cfg.get("quantization", "4bit"))
+    max_seq_len = int(
+        args.max_seq_len
+        if args.max_seq_len is not None
+        else cfg.get("max_seq_len", protocol_cfg.get("max_seq_len", 512))
+    )
+    max_new_tokens = int(
+        args.max_new_tokens
+        if args.max_new_tokens is not None
+        else cfg.get("max_new_tokens", protocol_cfg.get("max_new_tokens", 256))
+    )
+    do_sample = _resolve_bool(
+        cli_flag=args.do_sample,
+        cfg_value=cfg.get("do_sample"),
+        protocol_value=protocol_cfg.get("do_sample"),
+        default=False,
+    )
+    temperature = float(
+        args.temperature
+        if args.temperature is not None
+        else cfg.get("temperature", protocol_cfg.get("temperature", 1.0))
+    )
+    top_p = float(
+        args.top_p
+        if args.top_p is not None
+        else cfg.get("top_p", protocol_cfg.get("top_p", 1.0))
+    )
+    _validate_decoding_args(
+        max_seq_len=max_seq_len,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+    )
     test_languages = _parse_language_list(args.test_languages)
     if test_languages is None:
-        cfg_languages = cfg.get("test_languages")
-        if isinstance(cfg_languages, list):
-            test_languages = [str(lang).strip().lower() for lang in cfg_languages if str(lang).strip()]
+        test_languages = _normalize_language_list(cfg.get("test_languages"))
+    if test_languages is None:
+        test_languages = protocol_languages
+    if enforce_protocol and protocol_languages is not None:
+        if test_languages is None or set(test_languages) != set(protocol_languages):
+            raise ValueError(
+                "test_languages mismatch with eval protocol. "
+                f"protocol={sorted(protocol_languages)} current={sorted(test_languages or [])}"
+            )
+    if strict_schema and not test_languages:
+        raise ValueError("strict_schema=True requires explicit test_languages.")
+
+    if enforce_protocol:
+        protocol_task = str(protocol_cfg.get("task", "")).strip().lower()
+        cfg_task = str(cfg.get("task", "sparql")).strip().lower()
+        if protocol_task and cfg_task and protocol_task != cfg_task:
+            raise ValueError(f"Task mismatch between config ({cfg_task}) and eval protocol ({protocol_task}).")
+        decode_mismatches = []
+        for key, current in (
+            ("max_seq_len", max_seq_len),
+            ("max_new_tokens", max_new_tokens),
+            ("do_sample", do_sample),
+            ("temperature", temperature),
+            ("top_p", top_p),
+        ):
+            if key in protocol_cfg and protocol_cfg.get(key) != current:
+                decode_mismatches.append((key, protocol_cfg.get(key), current))
+        if decode_mismatches:
+            mismatch_text = ", ".join(f"{k}: protocol={p} current={c}" for k, p, c in decode_mismatches)
+            raise ValueError(f"Decoding config mismatch with eval protocol: {mismatch_text}")
+        for key, current in (
+            ("cache_dir", cache_dir),
+            ("offline_only", offline_only),
+            ("test_data_path", test_data_path),
+        ):
+            if key in protocol_cfg and protocol_cfg.get(key) != current:
+                raise ValueError(
+                    f"{key} mismatch with eval protocol: protocol={protocol_cfg.get(key)} current={current}"
+                )
+
     seed = args.seed
 
     if not predictions_file:
@@ -708,8 +1452,16 @@ def main() -> None:
             raise ValueError("test_data is required (via --test_data or config test_data_path).")
         if not Path(test_data_path).exists():
             raise FileNotFoundError(f"Test data not found: {test_data_path}")
-    elif not Path(predictions_file).exists():
-        raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
+    else:
+        if not Path(predictions_file).exists():
+            raise FileNotFoundError(f"Predictions file not found: {predictions_file}")
+        if not run_metadata_file:
+            run_metadata_file = _find_default_run_metadata_path(predictions_file)
+        if enforce_protocol and strict_schema and not Path(run_metadata_file).exists():
+            raise FileNotFoundError(
+                "Strict protocol validation requires run_metadata.json. "
+                f"Not found: {run_metadata_file}"
+            )
 
     ensure_dir(output_dir)
     logger = setup_logging(os.path.join(output_dir, "eval.log"), logger_name="alrem")
@@ -718,12 +1470,18 @@ def main() -> None:
     logger.info("Predictions file mode: %s", bool(predictions_file))
     if predictions_file:
         logger.info("Predictions file: %s", predictions_file)
+        logger.info("Run metadata file: %s", run_metadata_file or "(none)")
     else:
         logger.info("Model: %s", model_name)
         logger.info("Adapter: %s", adapter_path)
         logger.info("Test data: %s", test_data_path)
     logger.info("Cache dir: %s", cache_dir)
     logger.info("Offline only: %s", offline_only)
+    logger.info("fail_on_cache_miss: %s", fail_on_cache_miss)
+    logger.info("Eval protocol: %s", eval_protocol_loaded_path or "(none)")
+    if protocol_id:
+        logger.info("Protocol id: %s", protocol_id)
+    logger.info("Result partition: %s", protocol_result_partition)
     logger.info("Output dir: %s", output_dir)
     logger.info(
         "Decoding: max_seq_len=%d max_new_tokens=%d do_sample=%s temperature=%.3f top_p=%.3f",
@@ -733,10 +1491,29 @@ def main() -> None:
         temperature,
         top_p,
     )
+    logger.info("Primary metrics (protocol): %s", primary_metric_names)
+    logger.info("Aux metrics (protocol): %s", aux_metric_names)
 
     results: List[Dict[str, Any]]
+    run_metadata: Dict[str, Any] = {}
     if predictions_file:
         results = _load_predictions_jsonl(predictions_file)
+        if run_metadata_file and Path(run_metadata_file).exists():
+            run_metadata = _load_json(run_metadata_file)
+            _validate_run_metadata_schema(
+                run_metadata,
+                strict_schema=strict_schema,
+                enforce_protocol=enforce_protocol,
+                expected_protocol_id=protocol_id,
+                expected_result_partition=protocol_result_partition,
+                allowed_modes=protocol_allowed_modes,
+                protocol_cfg=protocol_cfg,
+                predictions=results,
+            )
+        elif enforce_protocol and strict_schema:
+            raise FileNotFoundError(
+                "Strict protocol validation requires run_metadata.json in predictions mode."
+            )
         logger.info("Loaded %d predictions from file", len(results))
         if args.max_samples:
             results = results[: args.max_samples]
@@ -779,6 +1556,13 @@ def main() -> None:
 
         # Generate
         logger.info("Starting generation...")
+        run_name_for_id = str(cfg.get("run_name", "")).strip() or Path(output_dir).name
+        run_id = build_run_id(
+            run_name=run_name_for_id,
+            mode="adapter",
+            protocol_id=protocol_id,
+            seed=seed,
+        )
         results = batch_generate(
             model, tokenizer, test_data,
             max_seq_len=max_seq_len,
@@ -786,8 +1570,55 @@ def main() -> None:
             do_sample=do_sample,
             temperature=temperature,
             top_p=top_p,
+            run_id=run_id,
+            protocol_id=protocol_id,
         )
         logger.info("Generation complete: %d results", len(results))
+        run_metadata = {
+            "run_id": run_id,
+            "run_name": run_name_for_id,
+            "mode": "adapter",
+            "method": str(cfg.get("method", "adapter")).strip().lower() or "adapter",
+            "task": "sparql",
+            "model_name_or_path": model_name,
+            "adapter_path": adapter_path,
+            "test_data_path": test_data_path,
+            "test_languages": test_languages or [],
+            "max_seq_len": max_seq_len,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_p": top_p,
+            "cache_dir": cache_dir,
+            "offline_only": offline_only,
+            "result_partition": protocol_result_partition,
+            "protocol_name": protocol_name,
+            "protocol_version": protocol_version,
+            "protocol_id": protocol_id,
+            "seed": seed,
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "output_dir": output_dir,
+        }
+        _validate_run_metadata_schema(
+            run_metadata,
+            strict_schema=strict_schema,
+            enforce_protocol=enforce_protocol,
+            expected_protocol_id=protocol_id,
+            expected_result_partition=protocol_result_partition,
+            allowed_modes=protocol_allowed_modes,
+            protocol_cfg=protocol_cfg,
+            predictions=results,
+        )
+
+    expected_run_id = str(run_metadata.get("run_id", "")).strip() if run_metadata else ""
+    _validate_predictions_schema(
+        results,
+        strict_schema=strict_schema,
+        expected_protocol_id=protocol_id,
+        expected_run_id=expected_run_id,
+        allowed_modes=protocol_allowed_modes,
+    )
+    _cleanup_internal_prediction_fields(results)
 
     # Save raw predictions
     preds_path = os.path.join(output_dir, "predictions.jsonl")
@@ -796,10 +1627,65 @@ def main() -> None:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     logger.info("Predictions saved to %s", preds_path)
 
+    metadata_path = os.path.join(output_dir, "run_metadata.json")
+    if run_metadata:
+        save_json(run_metadata, metadata_path)
+        logger.info("Run metadata saved to %s", metadata_path)
+
     # Compute metrics
     cache = SPARQLCache(cache_dir=cache_dir, force_offline=offline_only)
     logger.info("Computing metrics (offline_only=%s)...", offline_only)
-    metrics = compute_all_metrics(results, cache, offline_only=offline_only)
+    metrics = compute_all_metrics(
+        results,
+        cache,
+        offline_only=offline_only,
+        expected_languages=test_languages,
+        allowed_error_types=allowed_error_types,
+        fail_on_cache_miss=fail_on_cache_miss,
+    )
+    metric_values = {
+        "EA": metrics["execution_accuracy"],
+        "ER": metrics["executable_rate"],
+        "CLC-Ans": metrics.get("cross_lingual_consistency", {}).get("clc_ans", 0.0),
+        "CLC-Struct": metrics.get("cross_lingual_consistency", {}).get("clc_struct", 0.0),
+        "NormEM": metrics["normalized_em"],
+        "AnswerF1": metrics["answer_f1_macro"],
+    }
+    metrics["metric_protocol"] = {
+        "primary_metrics": primary_metric_names,
+        "aux_metrics": aux_metric_names,
+        "metric_values": {k: metric_values[k] for k in primary_metric_names + aux_metric_names if k in metric_values},
+    }
+    metrics["eval_protocol"] = {
+        "path": eval_protocol_loaded_path,
+        "protocol_name": protocol_name,
+        "protocol_version": protocol_version,
+        "protocol_id": protocol_id,
+        "enforce_protocol": enforce_protocol,
+        "strict_schema": strict_schema,
+        "main_table_protocol": main_table_protocol,
+        "result_partition": protocol_result_partition,
+        "fail_on_cache_miss": fail_on_cache_miss,
+        "allowed_error_types": sorted(allowed_error_types),
+        "primary_metrics": primary_metric_names,
+        "aux_metrics": aux_metric_names,
+        "test_languages": test_languages or [],
+        "decoding": {
+            "max_seq_len": max_seq_len,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "top_p": top_p,
+        },
+    }
+    if run_metadata:
+        metrics["run_metadata"] = {
+            "path": metadata_path,
+            "run_id": run_metadata.get("run_id", ""),
+            "mode": run_metadata.get("mode", ""),
+            "method": run_metadata.get("method", ""),
+            "result_partition": run_metadata.get("result_partition", ""),
+        }
 
     # Save metrics
     metrics_path = os.path.join(output_dir, "metrics.json")
@@ -835,6 +1721,7 @@ def main() -> None:
                 clc.get("clc_struct", 0) * 100,
                 clc.get("struct_consistent_groups", 0),
                 clc.get("num_groups", 0))
+    logger.info("CLC incomplete groups: %d", clc.get("incomplete_group_count", 0))
     logger.info("-" * 60)
     logger.info("Per-language breakdown:")
     for lang, stats in metrics.get("per_language", {}).items():

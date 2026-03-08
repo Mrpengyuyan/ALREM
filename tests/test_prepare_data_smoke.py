@@ -3,7 +3,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -36,6 +36,14 @@ def _qald_item(qid: str, sparql: str, langs: Dict[str, str]) -> Dict[str, Any]:
         "question": [{"language": lang, "string": text} for lang, text in langs.items()],
         "query": {"sparql": sparql},
     }
+
+
+def _signature(row: Dict[str, Any]) -> str:
+    question = " ".join(str(row.get("question", "")).strip().split()).lower()
+    sparql = " ".join(str(row.get("sparql", "")).strip().split()).lower()
+    if not question or not sparql:
+        return ""
+    return hashlib.md5(f"{question}\t{sparql}".encode("utf-8")).hexdigest()
 
 
 def test_prepare_data_offline_smoke(tmp_path: Path) -> None:
@@ -96,6 +104,7 @@ def test_prepare_data_offline_smoke(tmp_path: Path) -> None:
         "--offline-only",
         "--qald-test-languages",
         "en,de,es,ru",
+        "--allow-incomplete-test-languages",
     ]
     completed = subprocess.run(
         cmd,
@@ -115,14 +124,38 @@ def test_prepare_data_offline_smoke(tmp_path: Path) -> None:
         output_dir / "qald9plus_stage2_train.jsonl",
         output_dir / "qald9plus_stage2_dev.jsonl",
         output_dir / "qald9plus_test.jsonl",
-        output_dir / "qald9plus_high_stakes_test.jsonl",
+        output_dir / "qald9plus_icl_few_shot_pool.jsonl",
         output_dir / "prepare_stats.json",
     ]
     for file_path in expected_files:
         assert file_path.exists(), f"missing output file: {file_path}"
+    assert not (output_dir / "qald9plus_high_stakes_test.jsonl").exists()
+    assert not (output_dir / "archive" / "qald9plus_high_stakes_test.jsonl").exists()
 
     stats = json.loads((output_dir / "prepare_stats.json").read_text(encoding="utf-8"))
     assert stats["lcquad_train_samples"] > 0
     assert stats["qald_train_samples"] > 0
     assert stats["qald_test_samples"] > 0
-    assert stats["qald_high_stakes_status"] in {"ok", "skipped_offline_cache_miss"}
+    assert stats["qald_high_stakes_status"] in {"ok", "skipped_offline_cache_miss", "skipped_disabled"}
+    assert stats["qald_high_stakes_path"] == ""
+    assert stats["qald_icl_few_shot_pool_samples"] > 0
+
+    pool_path = output_dir / "qald9plus_icl_few_shot_pool.jsonl"
+    test_path = output_dir / "qald9plus_test.jsonl"
+    pool_rows = [
+        json.loads(line)
+        for line in pool_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    test_rows = [
+        json.loads(line)
+        for line in test_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    pool_qids: Set[str] = {str(row.get("qid", "")).strip() for row in pool_rows if str(row.get("qid", "")).strip()}
+    test_qids: Set[str] = {str(row.get("qid", "")).strip() for row in test_rows if str(row.get("qid", "")).strip()}
+    assert not (pool_qids & test_qids)
+
+    pool_signatures = {sig for sig in (_signature(row) for row in pool_rows) if sig}
+    test_signatures = {sig for sig in (_signature(row) for row in test_rows) if sig}
+    assert not (pool_signatures & test_signatures)

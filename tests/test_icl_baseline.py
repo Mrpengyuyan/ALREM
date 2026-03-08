@@ -4,8 +4,10 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from src import run_icl_baseline as icl_baseline
+from src.run_identity import build_run_id
 from src.run_icl_baseline import (
     _build_few_shot_pool,
     _collect_non_empty_qids,
@@ -21,6 +23,50 @@ def _write_jsonl(path: Path, rows) -> None:  # type: ignore[no-untyped-def]
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _write_eval_protocol(
+    path: Path,
+    *,
+    test_data_path: str,
+    test_languages: list[str],
+    max_seq_len: int = 128,
+    max_new_tokens: int = 32,
+    do_sample: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+) -> None:
+    payload = {
+        "protocol_name": "unit_test_protocol",
+        "protocol_version": "v1",
+        "protocol_id": "unit_test_protocol:v1",
+        "task": "sparql",
+        "enforce_protocol": True,
+        "strict_schema": True,
+        "main_table_protocol": True,
+        "result_partition": "unified_codechain",
+        "test_data_path": test_data_path,
+        "test_languages": test_languages,
+        "max_seq_len": max_seq_len,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "cache_dir": "data/sparql/cache",
+        "offline_only": True,
+        "fail_on_cache_miss": True,
+        "allowed_modes": ["adapter", "icl_zero", "icl_fewshot"],
+        "allowed_error_types": [
+            "generation_empty",
+            "syntax_or_parse_error",
+            "execution_error",
+            "wrong_answer",
+        ],
+        "primary_metrics": ["EA", "ER", "CLC-Ans", "CLC-Struct"],
+        "aux_metrics": ["NormEM", "AnswerF1"],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
 def _isolated_logger(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -93,8 +139,25 @@ def test_validate_no_qid_overlap_rejects_leakage() -> None:
         _validate_no_qid_overlap(pool_data=pool_data, test_data=test_data)
 
 
+def test_validate_no_qid_overlap_rejects_signature_overlap_when_qid_missing() -> None:
+    pool_data = [
+        {"qid": "", "question": "Who is Q1?", "sparql": "SELECT ?x WHERE { wd:Q1 wdt:P31 ?x }"},
+    ]
+    test_data = [
+        {"qid": "", "question": "  Who   is   q1? ", "sparql": "SELECT ?x WHERE { wd:Q1 wdt:P31 ?x }"},
+    ]
+    with pytest.raises(ValueError, match="normalized \\(question,sparql\\) pairs"):
+        _validate_no_qid_overlap(pool_data=pool_data, test_data=test_data)
+
+
 def test_main_zero_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     test_data_path = tmp_path / "test.jsonl"
+    protocol_path = tmp_path / "eval_protocol.yaml"
+    _write_eval_protocol(
+        protocol_path,
+        test_data_path=str(test_data_path),
+        test_languages=["en", "de"],
+    )
     _write_jsonl(
         test_data_path,
         [
@@ -107,6 +170,7 @@ def test_main_zero_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: ign
 
     args = SimpleNamespace(
         config=None,
+        eval_protocol=str(protocol_path),
         model_name="dummy-model",
         test_data=str(test_data_path),
         output_dir=str(tmp_path / "outputs"),
@@ -136,28 +200,51 @@ def test_main_zero_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: ign
     run_dir = tmp_path / "outputs" / "icl_zero_smoke"
     preds_path = run_dir / "predictions.jsonl"
     report_path = run_dir / "run_report.json"
+    metadata_path = run_dir / "run_metadata.json"
     assert preds_path.exists()
     assert report_path.exists()
+    assert metadata_path.exists()
 
     preds = [json.loads(line) for line in preds_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(preds) == 2
+    expected_run_id = build_run_id(
+        run_name="icl_zero_smoke",
+        mode="icl_zero",
+        protocol_id="unit_test_protocol:v1",
+        seed=123,
+    )
     assert {row["language"] for row in preds} == {"en", "de"}
     assert all(row["mode"] == "icl_zero" for row in preds)
+    assert all(row["run_id"] == expected_run_id for row in preds)
+    assert all("protocol_id" in row for row in preds)
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["num_predictions"] == 2
     assert report["mode"] == "icl_zero"
     assert report["seed"] == 123
+    assert "eval_protocol" in report
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["run_id"] == expected_run_id
+    assert metadata["mode"] == "icl_zero"
+    assert metadata["result_partition"] == "unified_codechain"
 
 
 def test_main_few_shot_missing_pool_raises(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     test_data_path = tmp_path / "test.jsonl"
+    protocol_path = tmp_path / "eval_protocol.yaml"
+    _write_eval_protocol(
+        protocol_path,
+        test_data_path=str(test_data_path),
+        test_languages=["en"],
+    )
     _write_jsonl(
         test_data_path,
         [{"qid": "q1", "language": "en", "question": "q1", "sparql": "SELECT ?x WHERE { wd:Q1 wdt:P31 ?x }"}],
     )
     args = SimpleNamespace(
         config=None,
+        eval_protocol=str(protocol_path),
         model_name="dummy-model",
         test_data=str(test_data_path),
         output_dir=str(tmp_path / "outputs"),
@@ -187,6 +274,12 @@ def test_main_few_shot_missing_pool_raises(monkeypatch, tmp_path: Path) -> None:
 def test_main_few_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
     test_data_path = tmp_path / "test.jsonl"
     pool_path = tmp_path / "pool.jsonl"
+    protocol_path = tmp_path / "eval_protocol.yaml"
+    _write_eval_protocol(
+        protocol_path,
+        test_data_path=str(test_data_path),
+        test_languages=["en"],
+    )
     _write_jsonl(
         test_data_path,
         [
@@ -205,6 +298,7 @@ def test_main_few_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: igno
 
     args = SimpleNamespace(
         config=None,
+        eval_protocol=str(protocol_path),
         model_name="dummy-model",
         test_data=str(test_data_path),
         output_dir=str(tmp_path / "outputs"),
@@ -243,3 +337,45 @@ def test_main_few_shot_smoke(monkeypatch, tmp_path: Path) -> None:  # type: igno
     assert all(len(examples) == 2 for examples in seen_examples)
     for examples in seen_examples:
         assert all(ex["question"].startswith("pool-") for ex in examples)
+
+
+def test_main_invalid_sampling_args_raises(monkeypatch, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    test_data_path = tmp_path / "test.jsonl"
+    _write_jsonl(
+        test_data_path,
+        [{"qid": "q1", "language": "en", "question": "q1", "sparql": "SELECT ?x WHERE { wd:Q1 wdt:P31 ?x }"}],
+    )
+    protocol_path = tmp_path / "eval_protocol.yaml"
+    _write_eval_protocol(
+        protocol_path,
+        test_data_path=str(test_data_path),
+        test_languages=["en"],
+    )
+
+    args = SimpleNamespace(
+        config=None,
+        eval_protocol=str(protocol_path),
+        model_name="dummy-model",
+        test_data=str(test_data_path),
+        output_dir=str(tmp_path / "outputs"),
+        run_name="icl_bad_sampling",
+        mode="zero",
+        few_shot_pool=None,
+        few_shot_k=None,
+        few_shot_seed=None,
+        quantization="none",
+        precision="bf16",
+        max_seq_len=128,
+        max_new_tokens=32,
+        do_sample=True,
+        temperature=1.0,
+        top_p=1.2,
+        test_languages="en",
+        max_samples=None,
+        seed=42,
+    )
+    monkeypatch.setattr(icl_baseline, "parse_args", lambda: args)
+    monkeypatch.setattr(icl_baseline, "setup_logging", _isolated_logger)
+
+    with pytest.raises(ValueError, match="top_p must be in \\(0, 1\\]"):
+        icl_baseline.main()

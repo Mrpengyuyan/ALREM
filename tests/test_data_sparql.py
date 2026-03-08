@@ -118,6 +118,27 @@ def test_load_qald9plus_train_test_language_filter_and_default(tmp_path: Path, c
     assert "missing language='ru'" in caplog.text
 
 
+def test_load_qald9plus_test_strict_languages_raises_on_missing_language(tmp_path: Path) -> None:
+    test_payload = {
+        "questions": [
+            _build_qald_question_item(
+                "q3",
+                "SELECT ?x WHERE { wd:Q3 wdt:P31 ?x }",
+                {"en": "q3 en", "de": "q3 de", "es": "q3 es"},
+            )
+        ]
+    }
+    _write_json(tmp_path / "qald_9_plus_test_wikidata.json", test_payload)
+    _write_json(tmp_path / "qald_9_plus_train_wikidata.json", {"questions": []})
+
+    with pytest.raises(ValueError, match="incomplete for strict mode"):
+        load_qald9plus_test(
+            str(tmp_path),
+            languages=["en", "de", "es", "ru"],
+            strict_languages=True,
+        )
+
+
 def test_split_qald_train_dev_grouped_by_qid() -> None:
     train_data = [
         {"question": "q1 en", "sparql": "s1", "language": "en", "qid": "q1"},

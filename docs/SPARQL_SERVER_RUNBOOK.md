@@ -112,6 +112,7 @@ STAGE1_CKPT=outputs/sparql_s1_alrem bash scripts/run_stage2.sh
 ```bash
 CONFIG=configs/sparql_stage1_alrem.yaml RUN_NAME=smoke_s1 MAX_TRAIN=32 MAX_EVAL=16 bash scripts/run_stage1.sh
 CONFIG=configs/sparql_stage2_alrem.yaml STAGE1_CKPT=outputs/smoke_s1 RUN_NAME=smoke_s2 MAX_TRAIN=32 MAX_EVAL=16 bash scripts/run_stage2.sh
+CONFIG=configs/sparql_stage2_alrem.yaml STAGE1_CKPT=outputs/smoke_s1 RUN_NAME=smoke_s2 RUN_EVAL=true OFFLINE_ONLY=true RUN_SUMMARY=true bash scripts/run_stage2.sh
 ```
 
 ## 7) Frequent Failure Modes

@@ -1,6 +1,5 @@
-"""Train SFT with ALREM / Uniform / Matched LoRA.
+"""Train SFT with ALREM / Uniform / Matched LoRA for SPARQL.
 
-Supports tasks: mgsm, flores, sparql.
 Supports QLoRA 4-bit quantization.
 Supports two-stage training (Stage 2 resumes from Stage 1 adapter checkpoint).
 """
@@ -28,15 +27,13 @@ from transformers import (
 )
 
 from .alrem_rank_pattern import build_alpha_pattern, estimate_alrem_params, solve_r_match
-from .data_flores import build_flores_train_text, load_flores_dataset
-from .data_mgsm import build_mgsm_train_text, load_mgsm_dataset
 from .lora_utils import (
     compute_lora_params_by_layer,
     compute_total_lora_params,
     estimate_lora_params_uniform,
     summarize_ranks,
 )
-from .prompts import FLORES_PROMPT, MGSM_PROMPT, build_sparql_train_text
+from .prompts import build_sparql_train_text
 from .step_time_logging import StepTimeLoggingCallback
 from .utils import count_parameters, ensure_dir, load_yaml, save_json, save_yaml, set_seed, setup_logging
 
@@ -285,11 +282,18 @@ def _setup_lora(
     """
     target_modules = _ensure_list(cfg.get("target_modules", ["q_proj", "v_proj"]))
 
-    # ALREM v2 module-aware support
+    # ALREM v2 module-aware support (archive-only compatibility path).
+    # Main protocol uses target_modules + (r_high, r_low, r_uniform).
     target_modules_attn = _ensure_list(cfg.get("target_modules_attention"))
     target_modules_mlp = _ensure_list(cfg.get("target_modules_mlp"))
+    enable_legacy_alrem_v2 = bool(cfg.get("enable_legacy_alrem_v2", False))
 
     if target_modules_attn and target_modules_mlp:
+        if not enable_legacy_alrem_v2:
+            raise ValueError(
+                "Legacy ALREM v2 module-aware path is disabled by default and excluded from mainline protocol. "
+                "Set enable_legacy_alrem_v2=true only for archive/backward-compat experiments."
+            )
         from .alrem_rank_pattern import estimate_alrem_v2_params
         target_modules = list(set(target_modules_attn + target_modules_mlp))
         attn_config = {
@@ -533,33 +537,21 @@ def main() -> None:
         model.config.use_cache = False
 
     # ── Load data ──
-    task = cfg.get("task", "mgsm")
-    prompt_mgsm = cfg.get("mgsm_prompt", MGSM_PROMPT)
-    prompt_flores = cfg.get("flores_prompt", FLORES_PROMPT)
+    task = str(cfg.get("task", "sparql")).strip().lower()
+    if task != "sparql":
+        raise ValueError(
+            f"Unsupported task: {task}. This repository is now SPARQL-only. "
+            "Set task: sparql in config."
+        )
 
-    if task == "mgsm":
-        train_examples = load_mgsm_dataset(cfg, cfg.get("train_split", "train"))
-        eval_examples = load_mgsm_dataset(cfg, cfg.get("eval_split", "test"))
-        train_texts = [build_mgsm_train_text(ex, prompt_template=prompt_mgsm) for ex in train_examples]
-        eval_texts = [build_mgsm_train_text(ex, prompt_template=prompt_mgsm) for ex in eval_examples]
-        add_special_tokens = True
-    elif task == "flores":
-        train_examples = load_flores_dataset(cfg, cfg.get("train_split", "train"))
-        eval_examples = load_flores_dataset(cfg, cfg.get("eval_split", "dev"))
-        train_texts = [build_flores_train_text(ex, prompt_template=prompt_flores) for ex in train_examples]
-        eval_texts = [build_flores_train_text(ex, prompt_template=prompt_flores) for ex in eval_examples]
-        add_special_tokens = True
-    elif task == "sparql":
-        train_texts, eval_texts = _load_sparql_data(cfg, tokenizer)
-        # Chat template already injects model-specific special tokens.
-        add_special_tokens = False
-        if cfg.get("test_data_path"):
-            logger.info(
-                "SPARQL training uses train/dev only (model selection by eval loss). "
-                "test_data_path is ignored during training."
-            )
-    else:
-        raise ValueError("Unsupported task: %s" % task)
+    train_texts, eval_texts = _load_sparql_data(cfg, tokenizer)
+    # Chat template already injects model-specific special tokens.
+    add_special_tokens = False
+    if cfg.get("test_data_path"):
+        logger.info(
+            "SPARQL training uses train/dev only (model selection by eval loss). "
+            "test_data_path is ignored during training."
+        )
 
     max_train_samples = cfg.get("max_train_samples")
     max_eval_samples = cfg.get("max_eval_samples")

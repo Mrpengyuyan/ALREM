@@ -139,6 +139,10 @@ def build_module_aware_rank_pattern(
     mlp_config: Dict[str, Any],
 ) -> Tuple[Dict[str, int], int, int, int]:
     """
+    NOTE (archival scope):
+    This ALREM v2 branch is retained for backward compatibility only and is
+    not part of the current SPARQL paper mainline protocol.
+
     Build rank pattern for ALREM v2 with separate strategies for Attention and MLP.
     Attention: Sandwich (Bottom/Top=High, Middle=Low)
     MLP: Capacity Preserving (Uniform or Sandwich)

@@ -1,35 +1,32 @@
-# ALREM Research Codebase
+﻿# ALREM SPARQL Research Codebase
 
-This repository contains runnable research code for ALREM-based LoRA experiments across:
-- MGSM (math reasoning)
-- FLORES (translation)
-- Multilingual Text-to-SPARQL (LC-QuAD 2.0 -> QALD-9-plus, two-stage training)
+This repository is now focused on multilingual Text-to-SPARQL experiments:
+- Stage 1: LC-QuAD 2.0 (English)
+- Stage 2: QALD-9-plus (multilingual)
+- Unified evaluation: EA / ExecRate / NormEM / F1 / CLC
+- Task baselines: ICL zero-shot / few-shot
 
 Implemented LoRA methods:
-- `alrem` (sandwich rank pattern via `rank_pattern` / `alpha_pattern`)
+- `alrem` (main)
 - `uniform`
-- `matched` (parameter-matched uniform baseline)
-
-## What Is Stable In This Version
-- Two-stage SPARQL training is integrated in `src/train_sft.py`.
-- Stage2 adapter compatibility checks are enforced (base model, target modules, rank settings).
-- SPARQL execution is cache-first and supports strict offline evaluation.
-- Preflight checks and Linux run scripts are included.
-- Unit tests are available under `tests/`.
+- `matched` (parameter-matched uniform)
+- `alrem_strong`
+- `alrem_reverse_sandwich`
 
 ## Repository Layout
 
 ```text
 code/
-├── configs/
-├── scripts/
-├── src/
-├── tests/
-├── docs/
-│   └── SPARQL_SERVER_RUNBOOK.md
-├── data/
-├── outputs/
-└── requirements.txt
+├─ configs/
+├─ scripts/
+├─ src/
+├─ tests/
+├─ docs/
+│  ├─ SPARQL_EXPERIMENT_PLAN_AND_REPO_STEPS.md
+│  └─ SPARQL_SERVER_RUNBOOK.md
+├─ data/
+├─ outputs/
+└─ requirements.txt
 ```
 
 ## Environment Setup
@@ -39,15 +36,13 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Core dependencies include:
+Core dependencies:
 - `torch`, `transformers`, `peft`, `datasets`, `accelerate`
 - `SPARQLWrapper`, `langdetect`, `bitsandbytes`
 
-## SPARQL Pipeline (Recommended Main Path)
+## End-to-End Pipeline
 
-### 1) Prepare data (local-first, with optional download)
-
-From `code/`:
+### 1) Prepare data
 
 ```bash
 python scripts/prepare_data.py
@@ -63,56 +58,43 @@ python scripts/prepare_data.py \
   --qald-test-languages en,de,es,ru
 ```
 
-Offline cache-only mode:
+Notes:
+- Default is strict test-language completeness (missing target language causes fail-fast).
+- To allow incomplete language groups: `--allow-incomplete-test-languages`.
+- High-stakes subset is optional and disabled by default. Enable with `--build-high-stakes-subset`.
 
-```bash
-python scripts/prepare_data.py --offline-only
-```
-
-### 2) Preflight check
+### 2) Preflight checks
 
 ```bash
 bash scripts/preflight_sparql.sh configs/sparql_stage1_alrem.yaml
 bash scripts/preflight_sparql.sh configs/sparql_stage2_alrem.yaml
 ```
 
-### 3) Stage1 training (LC-QuAD 2.0)
+### 3) Stage1 training
 
 ```bash
 bash scripts/run_stage1.sh
 ```
 
-Or choose another config:
-
-```bash
-CONFIG=configs/sparql_stage1_uniform.yaml bash scripts/run_stage1.sh
-CONFIG=configs/sparql_stage1_param_match.yaml bash scripts/run_stage1.sh
-CONFIG=configs/sparql_stage1_alrem_strong.yaml bash scripts/run_stage1.sh
-CONFIG=configs/sparql_stage1_reverse_sandwich.yaml bash scripts/run_stage1.sh
-```
-
-### 4) Stage2 training (QALD-9-plus)
+### 4) Stage2 training
 
 ```bash
 bash scripts/run_stage2.sh
 ```
 
-Or choose another config:
+Train -> eval -> summary in one chained run:
 
 ```bash
-CONFIG=configs/sparql_stage2_uniform.yaml bash scripts/run_stage2.sh
-CONFIG=configs/sparql_stage2_param_match.yaml bash scripts/run_stage2.sh
-CONFIG=configs/sparql_stage2_alrem_strong.yaml bash scripts/run_stage2.sh
-CONFIG=configs/sparql_stage2_reverse_sandwich.yaml bash scripts/run_stage2.sh
+RUN_EVAL=true OFFLINE_ONLY=true RUN_SUMMARY=true bash scripts/run_stage2.sh
 ```
 
-Override Stage1 checkpoint when needed:
+Override Stage1 checkpoint:
 
 ```bash
 STAGE1_CKPT=outputs/sparql_s1_alrem bash scripts/run_stage2.sh
 ```
 
-### 5) ICL baselines (task-level baseline)
+### 5) ICL baselines
 
 Zero-shot:
 
@@ -126,52 +108,49 @@ Few-shot:
 CONFIG=configs/sparql_icl_few_shot.yaml bash scripts/run_icl.sh
 ```
 
-Windows PowerShell (no bash):
+Run ICL then evaluate immediately under the shared protocol:
 
-```powershell
-python -m src.run_icl_baseline --config configs/sparql_icl_zero_shot.yaml
-python -m src.run_icl_baseline --config configs/sparql_icl_few_shot.yaml
+```bash
+RUN_EVAL=true EVAL_PROTOCOL=configs/sparql_eval_shared.yaml bash scripts/run_icl.sh
+```
+
+Run ICL -> eval -> summary in one chained run:
+
+```bash
+RUN_EVAL=true RUN_SUMMARY=true bash scripts/run_icl.sh
 ```
 
 ### 6) Evaluation
 
+Adapter mode:
+
 ```bash
 bash scripts/run_eval.sh
 ```
 
-Windows PowerShell (no bash):
-
-```powershell
-python -m src.eval_sparql --config configs/sparql_stage2_alrem.yaml
-```
-
-Optional overrides:
-
-```bash
-CONFIG=configs/sparql_stage2_alrem.yaml \
-ADAPTER=outputs/sparql_s2_alrem \
-TEST_LANGUAGES=en,de,es,ru \
-OFFLINE_ONLY=true \
-bash scripts/run_eval.sh
-```
-
-Evaluate existing predictions (shared eval outlet for ICL/adapter):
+Predictions-only mode (shared outlet for ICL/adapter):
 
 ```bash
 PREDICTIONS_FILE=outputs/sparql_icl_zero/predictions.jsonl \
+RUN_METADATA_FILE=outputs/sparql_icl_zero/run_metadata.json \
 CACHE_DIR=data/sparql/cache \
 OFFLINE_ONLY=true \
 bash scripts/run_eval.sh
 ```
 
-### 7) Minimal smoke test
+Evaluate then regenerate paper tables:
 
 ```bash
-CONFIG=configs/sparql_stage1_alrem.yaml RUN_NAME=smoke_s1 MAX_TRAIN=32 MAX_EVAL=16 bash scripts/run_stage1.sh
-CONFIG=configs/sparql_stage2_alrem.yaml STAGE1_CKPT=outputs/smoke_s1 RUN_NAME=smoke_s2 MAX_TRAIN=32 MAX_EVAL=16 bash scripts/run_stage2.sh
+RUN_SUMMARY=true SUMMARY_OUTPUTS_DIR=outputs SUMMARY_OUT_DIR=paper_tables bash scripts/run_eval.sh
 ```
 
-## SPARQL Config Matrix
+Evaluation always uses the shared protocol by default:
+- `configs/sparql_eval_shared.yaml`
+- see `docs/EVAL_PROTOCOL.md`
+- main-table runs require `strict_schema=true` and `result_partition=unified_codechain`
+- `run_id` is now canonicalized as `<run_name>__<mode>__<protocol_id_tag>__s<seed>`
+
+## Config Matrix
 
 Stage1:
 - `configs/sparql_stage1_uniform.yaml`
@@ -191,27 +170,22 @@ ICL:
 - `configs/sparql_icl_zero_shot.yaml`
 - `configs/sparql_icl_few_shot.yaml`
 
-Important:
-- Do not mix Stage1 and Stage2 checkpoints from different base models.
-- Do not use strong/reverse Stage2 configs with normal Stage1 checkpoints.
-- Stage2 must use architecture-compatible Stage1 adapters.
+## Run Outputs
 
-## Training Outputs
-
-Each run writes into `outputs/<run_name>/`:
+Training run directory `outputs/<run_name>/` typically contains:
 - `config.yaml`
 - `train.log`
 - `params.json`
 - `run_report.json`
-- adapter/model files
+- adapter checkpoints
 
-`train.log` now includes elapsed-time progress lines like:
-- `[0:11:58] Rank:0; Step: 10/8000;`
+Evaluation output directory contains:
+- `predictions.jsonl`
+- `run_metadata.json`
+- `metrics.json`
+- `detailed_results.jsonl`
 
-Default interval is `eval_steps`; override with:
-- `step_time_log_interval` in YAML
-
-## Testing
+## Tests
 
 Run all tests:
 
@@ -219,37 +193,27 @@ Run all tests:
 python -m pytest -q tests
 ```
 
-Run only SPARQL prep smoke test:
+Run core SPARQL tests:
 
 ```bash
-python -m pytest -q tests/test_prepare_data_smoke.py
+python -m pytest -q tests/test_data_sparql.py tests/test_eval_sparql_logic.py tests/test_icl_baseline.py
 ```
 
-## Legacy MGSM / FLORES Usage
+## Result Tables
 
-Training:
-
-```bash
-python -m src.train_sft --config configs/alrem_mgsm.yaml
-python -m src.train_sft --config configs/uniform_mgsm.yaml
-python -m src.train_sft --config configs/alrem_flores.yaml
-python -m src.train_sft --config configs/uniform_flores.yaml
-```
-
-Evaluation:
-
-```bash
-python -m src.eval_mgsm --run_dir outputs/<run_name>
-python -m src.eval_flores --run_dir outputs/<run_name>
-```
-
-## Summarize Tables
+Generate SPARQL summary tables from `outputs/`:
 
 ```bash
 python scripts/summarize_results.py --outputs_dir outputs --out_dir paper_tables
 ```
 
-## Additional Documentation
+Tables generated:
+- `paper_tables/main_results.md` (only `unified_codechain`)
+- `paper_tables/external_results.md` (`external_*` partitions)
+- `paper_tables/per_language.md`
+- `paper_tables/clc_groups.md`
+- `paper_tables/error_distribution.md`
 
-For server deployment and end-to-end order of operations:
-- `docs/SPARQL_SERVER_RUNBOOK.md`
+Table policy:
+- Keep `external_reported` baselines in a separate section from `unified_codechain`.
+- Do not run same-class significance tests across these two sections.
